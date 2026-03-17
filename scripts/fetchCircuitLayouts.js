@@ -29,7 +29,7 @@ const CIRCUIT_MAP = {
   hungaroring:    'hu-1986',
   spa:            'be-1925',
   zandvoort:      'nl-1948',
-  monza:          'it-1953',
+  monza:          'it-1922',
   baku:           'az-2016',
   marina_bay:     'sg-2008',
   americas:       'us-2012',
@@ -43,7 +43,7 @@ const CIRCUIT_MAP = {
   ricard:         'fr-1969',
   madrid:         'es-2026',
   // Historical
-  imola:          null,         // not in bacinger repo
+  imola:          'it-1953',
   nurburgring:    'de-1927',
   hockenheimring: 'de-1932',
   estoril:        'pt-1972',
