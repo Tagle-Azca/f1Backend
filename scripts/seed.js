@@ -352,7 +352,7 @@ async function seedCassandra() {
     console.log(`\n  Race: ${raceName}`)
 
     await client.execute(
-      'INSERT INTO ${KS}.race_meta (race_id, race_name, session_key, year) VALUES (?,?,?,?)',
+      `INSERT INTO ${KS}.race_meta (race_id, race_name, session_key, year) VALUES (?,?,?,?)`,
       [raceId, raceName, session.session_key, session.year],
       { prepare: true }
     )
@@ -364,7 +364,7 @@ async function seedCassandra() {
     for (const driver of drivers) {
       const driverId = String(driver.driver_number)
       await client.execute(
-        'INSERT INTO ${KS}.race_drivers (race_id, driver_id, acronym, full_name, team_name) VALUES (?,?,?,?,?)',
+        `INSERT INTO ${KS}.race_drivers (race_id, driver_id, acronym, full_name, team_name) VALUES (?,?,?,?,?)`,
         [raceId, driverId, driver.name_acronym || '', driver.full_name || '', driver.team_name || ''],
         { prepare: true }
       )
@@ -435,7 +435,7 @@ async function seedCassandra() {
           }
           if (pos) {
             await client.execute(
-              'INSERT INTO ${KS}.race_positions (race_id, driver_id, lap, position) VALUES (?,?,?,?)',
+              `INSERT INTO ${KS}.race_positions (race_id, driver_id, lap, position) VALUES (?,?,?,?)`,
               [raceId, driverId, lap.lap_number, pos],
               { prepare: true }
             )
