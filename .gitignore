@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.log
+
+# npm artifacts
+f1db-back@1.0.0
+node
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/

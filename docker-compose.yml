@@ -1,0 +1,40 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: f1_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: f1_cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=f1cluster
+      - CASSANDRA_DC=datacenter1
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  dgraph:
+    image: dgraph/standalone:latest
+    container_name: f1_dgraph
+    ports:
+      - "8080:8080"   # HTTP (schema, mutations via HTTP)
+      - "9080:9080"   # gRPC (backend queries)
+    volumes:
+      - dgraph_data:/dgraph
+
+volumes:
+  mongo_data:
+  cassandra_data:
+  dgraph_data:

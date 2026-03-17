@@ -1,0 +1,33 @@
+{
+  "name": "f1db-back",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f",
+    "seed": "node scripts/seed.js",
+    "seed:mongo": "node scripts/seed.js --mongo",
+    "seed:cassandra": "node scripts/seed.js --cassandra",
+    "seed:dgraph": "node scripts/seed.js --dgraph",
+    "seed:history": "node scripts/seed.js --mongo --all-history",
+    "fetch:photos": "node scripts/fetchPhotos.js",
+    "fetch:circuits": "node scripts/fetchCircuitLayouts.js",
+    "init": "npm run db:up && npm run seed"
+  },
+  "dependencies": {
+    "cassandra-driver": "^4.7.2",
+    "cors": "^2.8.5",
+    "dgraph-js": "^21.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
