@@ -8,9 +8,23 @@ export function getDgraphClient() {
 }
 
 export async function connectDgraph() {
-  const url = process.env.DGRAPH_URL || 'localhost:9080'
+  const url    = process.env.DGRAPH_URL || 'localhost:9080'
+  const apiKey = process.env.DGRAPH_API_KEY
   try {
-    const stub = new dgraph.DgraphClientStub(url, grpc.credentials.createInsecure())
+    let credentials
+    if (apiKey) {
+      // Dgraph Cloud — TLS + API key auth
+      const channelCreds  = grpc.credentials.createSsl()
+      const metaCreds     = grpc.credentials.createFromMetadataGenerator((_, cb) => {
+        const meta = new grpc.Metadata()
+        meta.add('x-auth-token', apiKey)
+        cb(null, meta)
+      })
+      credentials = grpc.credentials.combineChannelCredentials(channelCreds, metaCreds)
+    } else {
+      credentials = grpc.credentials.createInsecure()
+    }
+    const stub = new dgraph.DgraphClientStub(url, credentials)
     const client = new dgraph.DgraphClient(stub)
     // Ping: run a trivial read-only query to confirm the connection
     const txn = client.newTxn({ readOnly: true })
