@@ -10,6 +10,9 @@
  *   npm run seed -- --dgraph
  */
 import 'dotenv/config'
+import fs   from 'fs'
+import path from 'path'
+import os   from 'os'
 import mongoose from 'mongoose'
 import cassandraDriver from 'cassandra-driver'
 
@@ -201,13 +204,28 @@ async function seedMongoDB() {
 async function seedCassandra() {
   let client
 
+  const KS = process.env.CASSANDRA_KEYSPACE || 'f1_telemetry'
+
   const ok = await waitForDB('Cassandra', async () => {
-    client = new cassandraDriver.Client({
-      contactPoints: [
-        `${process.env.CASSANDRA_HOST || '127.0.0.1'}:${process.env.CASSANDRA_PORT || 9042}`,
-      ],
-      localDataCenter: process.env.CASSANDRA_DC || 'datacenter1',
-    })
+    if (process.env.ASTRA_BUNDLE_B64) {
+      const bundlePath = path.join(os.tmpdir(), 'secure-connect-seed.zip')
+      fs.writeFileSync(bundlePath, Buffer.from(process.env.ASTRA_BUNDLE_B64, 'base64'))
+      client = new cassandraDriver.Client({
+        cloud: { secureConnectBundle: bundlePath },
+        credentials: {
+          username: process.env.ASTRA_CLIENT_ID,
+          password: process.env.ASTRA_CLIENT_SECRET,
+        },
+        keyspace: KS,
+      })
+    } else {
+      client = new cassandraDriver.Client({
+        contactPoints: [
+          `${process.env.CASSANDRA_HOST || '127.0.0.1'}:${process.env.CASSANDRA_PORT || 9042}`,
+        ],
+        localDataCenter: process.env.CASSANDRA_DC || 'datacenter1',
+      })
+    }
     await client.connect()
   }, 24, 5000)
   if (!ok) return
@@ -216,12 +234,14 @@ async function seedCassandra() {
   console.log('[Cassandra] Creating schema...')
   const exec = (cql) => client.execute(cql)
 
+  if (!process.env.ASTRA_BUNDLE_B64) {
+    await exec(`
+      CREATE KEYSPACE IF NOT EXISTS ${KS}
+      WITH replication = {'class':'SimpleStrategy','replication_factor':1}
+    `)
+  }
   await exec(`
-    CREATE KEYSPACE IF NOT EXISTS f1_telemetry
-    WITH replication = {'class':'SimpleStrategy','replication_factor':1}
-  `)
-  await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.race_meta (
+    CREATE TABLE IF NOT EXISTS ${KS}.race_meta (
       race_id    text PRIMARY KEY,
       race_name  text,
       session_key int,
@@ -229,7 +249,7 @@ async function seedCassandra() {
     )
   `)
   await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.lap_times (
+    CREATE TABLE IF NOT EXISTS ${KS}.lap_times (
       race_id    text,
       driver_id  text,
       lap_number int,
@@ -241,7 +261,7 @@ async function seedCassandra() {
     ) WITH CLUSTERING ORDER BY (lap_number ASC)
   `)
   await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.pit_stops (
+    CREATE TABLE IF NOT EXISTS ${KS}.pit_stops (
       race_id     text,
       driver_id   text,
       stop_number int,
@@ -252,7 +272,7 @@ async function seedCassandra() {
     ) WITH CLUSTERING ORDER BY (stop_number ASC)
   `)
   await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.stints (
+    CREATE TABLE IF NOT EXISTS ${KS}.stints (
       race_id      text,
       driver_id    text,
       stint_number int,
@@ -264,7 +284,7 @@ async function seedCassandra() {
     ) WITH CLUSTERING ORDER BY (driver_id ASC, stint_number ASC)
   `)
   await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.race_drivers (
+    CREATE TABLE IF NOT EXISTS ${KS}.race_drivers (
       race_id   text,
       driver_id text,
       acronym   text,
@@ -274,7 +294,7 @@ async function seedCassandra() {
     )
   `)
   await exec(`
-    CREATE TABLE IF NOT EXISTS f1_telemetry.race_positions (
+    CREATE TABLE IF NOT EXISTS ${KS}.race_positions (
       race_id   text,
       driver_id text,
       lap       int,
@@ -332,7 +352,7 @@ async function seedCassandra() {
     console.log(`\n  Race: ${raceName}`)
 
     await client.execute(
-      'INSERT INTO f1_telemetry.race_meta (race_id, race_name, session_key, year) VALUES (?,?,?,?)',
+      'INSERT INTO ${KS}.race_meta (race_id, race_name, session_key, year) VALUES (?,?,?,?)',
       [raceId, raceName, session.session_key, session.year],
       { prepare: true }
     )
@@ -344,7 +364,7 @@ async function seedCassandra() {
     for (const driver of drivers) {
       const driverId = String(driver.driver_number)
       await client.execute(
-        'INSERT INTO f1_telemetry.race_drivers (race_id, driver_id, acronym, full_name, team_name) VALUES (?,?,?,?,?)',
+        'INSERT INTO ${KS}.race_drivers (race_id, driver_id, acronym, full_name, team_name) VALUES (?,?,?,?,?)',
         [raceId, driverId, driver.name_acronym || '', driver.full_name || '', driver.team_name || ''],
         { prepare: true }
       )
@@ -391,7 +411,7 @@ async function seedCassandra() {
         if (!lap.lap_number || !lap.lap_duration) continue
 
         await client.execute(
-          `INSERT INTO f1_telemetry.lap_times
+          `INSERT INTO ${KS}.lap_times
            (race_id, driver_id, lap_number, lap_time, sector1, sector2, sector3)
            VALUES (?,?,?,?,?,?,?)`,
           [
@@ -415,7 +435,7 @@ async function seedCassandra() {
           }
           if (pos) {
             await client.execute(
-              'INSERT INTO f1_telemetry.race_positions (race_id, driver_id, lap, position) VALUES (?,?,?,?)',
+              'INSERT INTO ${KS}.race_positions (race_id, driver_id, lap, position) VALUES (?,?,?,?)',
               [raceId, driverId, lap.lap_number, pos],
               { prepare: true }
             )
@@ -451,7 +471,7 @@ async function seedCassandra() {
         for (let i = 0; i < stops.length; i++) {
           const pit = stops[i]
           await client.execute(
-            `INSERT INTO f1_telemetry.pit_stops
+            `INSERT INTO ${KS}.pit_stops
              (race_id, driver_id, stop_number, lap, duration, time)
              VALUES (?,?,?,?,?,?)`,
             [raceId, driverId, i + 1, pit.lap_number || 0, pit.pit_duration || 0, pit.date || ''],
@@ -473,7 +493,7 @@ async function seedCassandra() {
       for (const stint of stints) {
         if (!stint.driver_number || !stint.stint_number) continue
         await client.execute(
-          `INSERT INTO f1_telemetry.stints
+          `INSERT INTO ${KS}.stints
            (race_id, driver_id, stint_number, compound, lap_start, lap_end, tyre_age)
            VALUES (?,?,?,?,?,?,?)`,
           [
