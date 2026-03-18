@@ -40,12 +40,13 @@ export async function getConstructorStats(req, res, next) {
       const s = seasonsMap.get(race.season)
       s.races++
 
+      let raceHasPodium = false
       for (const r of myResults) {
         const pos = parseInt(r.position)
         const pts = parseFloat(r.points) || 0
         if (!isNaN(pos)) {
           if (pos === 1) { wins++; s.wins++ }
-          if (pos <= 3) podiums++
+          if (pos <= 3) raceHasPodium = true
         }
         points += pts
         s.points += pts
@@ -53,6 +54,7 @@ export async function getConstructorStats(req, res, next) {
           s.drivers.set(r.Driver.driverId, buildDriverName(r.Driver))
         }
       }
+      if (raceHasPodium) podiums++
 
       const hasPole = race.QualifyingResults?.some(
         q => q.Constructor?.constructorId === id && q.position === '1'
