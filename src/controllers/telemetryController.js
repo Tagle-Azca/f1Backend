@@ -261,6 +261,147 @@ export async function getRacePositions(req, res, next) {
   } catch (err) { next(err) }
 }
 
+// ── Team pace (constructor profile) ───────────────────────────
+
+export async function getTeamPace(req, res, next) {
+  if (!getCassandraClient()) return cassandraUnavailable(res)
+  try {
+    const { teamName, year, raceId: requestedRaceId } = req.query
+    if (!teamName || !year) return res.status(400).json({ message: 'teamName and year required' })
+
+    const metaRows = await cassandraQuery(
+      'SELECT race_id, race_name FROM race_meta WHERE year = ? ALLOW FILTERING',
+      [parseInt(year)]
+    )
+    if (!metaRows.length) return res.json(null)
+
+    const sortedRaces = [...metaRows].sort((a, b) => {
+      const key = r => parseInt(r.race_id.split('_')[1] || 0)
+      return key(b) - key(a)
+    })
+
+    // Find all races that have this team, and the target race (requested or most recent)
+    const keywords = teamName.toLowerCase().split(' ').filter(w => w.length > 3)
+    let teamDrivers = [], foundRaceId = null, foundRaceName = null
+    const availableRaces = []
+
+    for (const meta of sortedRaces) {
+      const rows = await cassandraQuery(
+        'SELECT driver_id, acronym, full_name, team_name FROM race_drivers WHERE race_id = ?',
+        [meta.race_id]
+      )
+      const matched = rows.filter(d =>
+        keywords.some(kw => d.team_name?.toLowerCase().includes(kw))
+      )
+      if (matched.length >= 1) {
+        availableRaces.push({ raceId: meta.race_id, raceName: meta.race_name })
+        if (!foundRaceId && (!requestedRaceId || meta.race_id === requestedRaceId)) {
+          teamDrivers = matched; foundRaceId = meta.race_id; foundRaceName = meta.race_name
+        }
+      }
+    }
+    if (!teamDrivers.length) return res.json(null)
+
+    // Fetch lap times + stints for team drivers + all drivers (field avg)
+    const allDriverRows = await cassandraQuery(
+      'SELECT driver_id FROM race_drivers WHERE race_id = ?', [foundRaceId]
+    )
+
+    const fieldLapMap = new Map()     // lap → [times]
+    const fieldS = { s1: 0, s2: 0, s3: 0, n: 0 }
+
+    await Promise.all(allDriverRows.map(async d => {
+      const rows = await cassandraQuery(
+        'SELECT lap_number, lap_time, sector1, sector2, sector3 FROM lap_times WHERE race_id = ? AND driver_id = ? ORDER BY lap_number ASC',
+        [foundRaceId, d.driver_id]
+      )
+      for (const r of rows) {
+        if (!r.lap_time || r.lap_time <= 0) continue
+        if (!fieldLapMap.has(r.lap_number)) fieldLapMap.set(r.lap_number, [])
+        fieldLapMap.get(r.lap_number).push(r.lap_time)
+        if (r.sector1 && r.sector2 && r.sector3) {
+          fieldS.s1 += r.sector1; fieldS.s2 += r.sector2; fieldS.s3 += r.sector3; fieldS.n++
+        }
+      }
+    }))
+
+    // Median lap time per lap (robust vs outliers)
+    const fieldAvgPerLap = [...fieldLapMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([lap, times]) => {
+        const s = [...times].sort((a, b) => a - b)
+        return { lap, avg: Math.round(s[Math.floor(s.length / 2)] * 1000) / 1000 }
+      })
+
+    // Overall field median (IQR-filtered)
+    const allTimes = fieldAvgPerLap.map(f => f.avg).sort((a, b) => a - b)
+    const p25 = allTimes[Math.floor(allTimes.length * 0.25)]
+    const p75 = allTimes[Math.floor(allTimes.length * 0.75)]
+    const iqr = p75 - p25
+    const clean = allTimes.filter(t => t >= p25 - 1.5 * iqr && t <= p75 + 1.5 * iqr)
+    const fieldAvgLap = clean.length
+      ? Math.round(clean.reduce((a, b) => a + b, 0) / clean.length * 1000) / 1000
+      : null
+
+    // Per-driver lap data with compound overlay
+    const driverPace = await Promise.all(teamDrivers.map(async d => {
+      const [laps, stints] = await Promise.all([
+        cassandraQuery(
+          'SELECT lap_number, lap_time, sector1, sector2, sector3 FROM lap_times WHERE race_id = ? AND driver_id = ? ORDER BY lap_number ASC',
+          [foundRaceId, d.driver_id]
+        ),
+        cassandraQuery(
+          'SELECT compound, lap_start, lap_end FROM stints WHERE race_id = ? AND driver_id = ?',
+          [foundRaceId, d.driver_id]
+        ),
+      ])
+      return {
+        driverId: d.driver_id, acronym: d.acronym, fullName: d.full_name,
+        laps: laps
+          .filter(l => l.lap_time > 0)
+          .map(l => {
+            const stint = stints.find(s => l.lap_number >= s.lap_start && l.lap_number <= s.lap_end)
+            return {
+              lap: l.lap_number,
+              time: Math.round(l.lap_time * 1000) / 1000,
+              s1: l.sector1, s2: l.sector2, s3: l.sector3,
+              compound: stint?.compound || null,
+            }
+          }),
+      }
+    }))
+
+    // Team sector averages vs field
+    const teamS = { s1: 0, s2: 0, s3: 0, n: 0 }
+    for (const d of driverPace) {
+      for (const l of d.laps) {
+        if (l.s1 && l.s2 && l.s3) {
+          teamS.s1 += l.s1; teamS.s2 += l.s2; teamS.s3 += l.s3; teamS.n++
+        }
+      }
+    }
+
+    let sectorDominance = null
+    if (teamS.n > 0 && fieldS.n > 0) {
+      const tAvg = [teamS.s1 / teamS.n, teamS.s2 / teamS.n, teamS.s3 / teamS.n]
+      const fAvg = [fieldS.s1 / fieldS.n, fieldS.s2 / fieldS.n, fieldS.s3 / fieldS.n]
+      sectorDominance = [1, 2, 3].map((s, i) => ({
+        sector: `S${s}`,
+        teamAvg:  Math.round(tAvg[i] * 1000) / 1000,
+        fieldAvg: Math.round(fAvg[i] * 1000) / 1000,
+        delta:    Math.round((tAvg[i] - fAvg[i]) * 1000) / 1000, // negative = faster
+      }))
+    }
+
+    // availableRaces sorted oldest → newest for the selector
+    res.json({
+      raceId: foundRaceId, raceName: foundRaceName,
+      availableRaces: availableRaces.reverse(),
+      drivers: driverPace, fieldAvgLap, fieldAvgPerLap, sectorDominance,
+    })
+  } catch (err) { next(err) }
+}
+
 // ── Tire strategy ─────────────────────────────────────────────
 
 export async function getTireStrategy(req, res, next) {

@@ -3,6 +3,10 @@ import Race   from '../models/Race.js'
 import Driver from '../models/Driver.js'
 import { buildGraphFromMongo } from '../helpers/graphBuilder.js'
 import { buildDriverName, roundPoints } from '../utils/formatters.js'
+import { cached } from '../utils/cache.js'
+
+const GRAPH_TTL  = 15 * 60 * 1000 // 15 min
+const DRIVER_TTL = 10 * 60 * 1000 // 10 min
 
 // ── Shared helpers (only used in this file) ───────────────
 
@@ -191,7 +195,13 @@ export async function getDriverConnections(req, res, next) {
 export async function getDriverEgoGraph(req, res, next) {
   try {
     const { driverId } = req.params
+    const data = await cached(`ego-driver:${driverId}`, DRIVER_TTL, () => buildDriverEgoGraph(driverId))
+    if (!data.nodes.length) return res.json({ nodes: [], links: [], stats: null, debut: null })
+    res.json(data)
+  } catch (err) { next(err) }
+}
 
+async function buildDriverEgoGraph(driverId) {
     const [races, driver] = await Promise.all([
       Race.find({ 'Results.Driver.driverId': driverId })
         .select('season round raceName Circuit Results')
@@ -201,7 +211,7 @@ export async function getDriverEgoGraph(req, res, next) {
         .lean(),
     ])
 
-    if (!races.length) return res.json({ nodes: [], links: [], stats: null, debut: null })
+    if (!races.length) return { nodes: [], links: [], stats: null, debut: null }
 
     races.sort((a, b) => Number(a.season) - Number(b.season) || Number(a.round) - Number(b.round))
 
@@ -256,7 +266,7 @@ export async function getDriverEgoGraph(req, res, next) {
     const debutRace   = races[0]
     const debutResult = debutRace.Results.find(r => r.Driver?.driverId === driverId)
 
-    res.json({
+    return {
       nodes,
       links,
       stats: {
@@ -272,20 +282,24 @@ export async function getDriverEgoGraph(req, res, next) {
         circuitName: debutRace.Circuit?.circuitName || '',
         position:    debutResult?.position || null,
       },
-    })
-  } catch (err) { next(err) }
+    }
 }
 
 // Constructor ego-network: team at center, all drivers as spokes
 export async function getConstructorEgoGraph(req, res, next) {
   try {
     const { constructorId } = req.params
+    const data = await cached(`ego-ctor:${constructorId}`, GRAPH_TTL, () => buildConstructorEgoGraph(constructorId))
+    res.json(data)
+  } catch (err) { next(err) }
+}
 
+async function buildConstructorEgoGraph(constructorId) {
     const races = await Race.find({ 'Results.Constructor.constructorId': constructorId })
       .select('season raceName Results')
       .lean()
 
-    if (!races.length) return res.json({ nodes: [], links: [] })
+    if (!races.length) return { nodes: [], links: [] }
 
     races.sort((a, b) => Number(a.season) - Number(b.season))
 
@@ -332,8 +346,7 @@ export async function getConstructorEgoGraph(req, res, next) {
       links.push({ source: `team_${constructorId}`, target: `driver_${d.driverId}`, rel: 'drove_for' })
     }
 
-    res.json({ nodes, links, total: driverMap.size, seasons: races.map(r => r.season) })
-  } catch (err) { next(err) }
+    return { nodes, links, total: driverMap.size, seasons: races.map(r => r.season) }
 }
 
 export async function getDriverNode(req, res, next) {

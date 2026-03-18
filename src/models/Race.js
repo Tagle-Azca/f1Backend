@@ -45,5 +45,7 @@ const RaceSchema = new mongoose.Schema({
 RaceSchema.index({ season: 1, round: 1 }, { unique: true })
 RaceSchema.index({ season: 1 })
 RaceSchema.index({ 'Circuit.circuitId': 1 })
+RaceSchema.index({ 'Results.Constructor.constructorId': 1 })
+RaceSchema.index({ 'Results.Driver.driverId': 1 })
 
 export default mongoose.model('Race', RaceSchema)
