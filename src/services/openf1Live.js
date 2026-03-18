@@ -248,16 +248,26 @@ export async function getLiveDrivers(sessionKey) {
 }
 
 export async function getLiveLapTimes(sessionKey, driverId) {
-  const laps = await of1Fetch(`/laps?session_key=${sessionKey}&driver_number=${driverId}`)
+  const [laps, allStints] = await Promise.all([
+    of1Fetch(`/laps?session_key=${sessionKey}&driver_number=${driverId}`),
+    cachedFetch(sessionKey, 'stints', `/stints?session_key=${sessionKey}`),
+  ])
+
+  const driverStints = allStints.filter(s => String(s.driver_number) === String(driverId))
+
   return laps
     .filter(l => l.lap_duration != null)
-    .map(l => ({
-      lap_number: l.lap_number,
-      lap_time:   parseFloat(l.lap_duration),
-      sector1:    l.duration_sector_1 != null ? parseFloat(l.duration_sector_1) : null,
-      sector2:    l.duration_sector_2 != null ? parseFloat(l.duration_sector_2) : null,
-      sector3:    l.duration_sector_3 != null ? parseFloat(l.duration_sector_3) : null,
-    }))
+    .map(l => {
+      const stint = driverStints.find(s => l.lap_number >= s.lap_start && l.lap_number <= s.lap_end)
+      return {
+        lap_number: l.lap_number,
+        lap_time:   parseFloat(l.lap_duration),
+        sector1:    l.duration_sector_1 != null ? parseFloat(l.duration_sector_1) : null,
+        sector2:    l.duration_sector_2 != null ? parseFloat(l.duration_sector_2) : null,
+        sector3:    l.duration_sector_3 != null ? parseFloat(l.duration_sector_3) : null,
+        compound:   stint ? (stint.compound || 'UNKNOWN').toUpperCase() : null,
+      }
+    })
 }
 
 export async function getLivePitStops(sessionKey, driverId) {
@@ -328,6 +338,79 @@ export async function getLiveTireStrategy(sessionKey) {
       }
     })
     .sort((a, b) => a.acronym.localeCompare(b.acronym))
+}
+
+// ── Safety Car / VSC periods ──────────────────────────────────
+
+/**
+ * Fetch race control events and return SC/VSC periods as
+ * [{ type: 'SC'|'VSC', lapStart, lapEnd }] sorted by lapStart.
+ * Works for any sessionKey — historical or live.
+ */
+export async function getSafetyCarPeriods(sessionKey) {
+  const events = await cachedFetch(sessionKey, 'race_control', `/race_control?session_key=${sessionKey}`)
+  if (!Array.isArray(events) || !events.length) return []
+
+  // Sort by timestamp — lap_number can be null on end-of-SC events, so date is more reliable
+  const sorted = [...events].sort((a, b) => {
+    const ta = new Date(a.date || 0).getTime()
+    const tb = new Date(b.date || 0).getTime()
+    if (ta !== tb) return ta - tb
+    return (a.lap_number ?? 0) - (b.lap_number ?? 0)
+  })
+
+  // Debug: log SC/VSC related events to server console
+  const relevant = sorted.filter(e => {
+    const t = `${e.category} ${e.flag} ${e.message}`.toUpperCase()
+    return t.includes('SAFETY') || t.includes('VSC') || t.includes('VIRTUAL')
+  })
+  if (relevant.length) {
+    console.log(`[SC] session=${sessionKey} events:`,
+      relevant.map(e => `lap=${e.lap_number ?? 'null'} cat=${e.category} flag=${e.flag} msg=${e.message}`))
+  }
+
+  const periods = []
+  let openSC  = null  // { type: 'SC',  lapStart }
+  let openVSC = null  // { type: 'VSC', lapStart }
+  let lastKnownLap = 1
+
+  for (const e of sorted) {
+    // Use lap_number if present; otherwise fall back to last known lap
+    const lap = e.lap_number != null ? e.lap_number : lastKnownLap
+    if (e.lap_number != null) lastKnownLap = e.lap_number
+
+    const flag = (e.flag     || '').toUpperCase().trim()
+    const msg  = (e.message  || '').toUpperCase().trim()
+    const cat  = (e.category || '').toLowerCase().trim()
+    const text = `${flag} ${msg}`
+
+    // ── VSC ──────────────────────────────────────────
+    if (cat === 'vsc' || (text.includes('VIRTUAL') && text.includes('SAFETY'))) {
+      if (text.includes('DEPLOY')) {
+        if (openVSC) periods.push({ ...openVSC, lapEnd: lap })
+        openVSC = { type: 'VSC', lapStart: lap }
+      } else if (text.includes('END') || text.includes('IN THIS') || text.includes('CLEAR')) {
+        if (openVSC) { periods.push({ ...openVSC, lapEnd: lap + 1 }); openVSC = null }
+      }
+    }
+    // ── SC (not VSC) ─────────────────────────────────
+    else if (cat === 'safetycar' || (text.includes('SAFETY CAR') && !text.includes('VIRTUAL'))) {
+      if (text.includes('DEPLOY')) {
+        if (openSC) periods.push({ ...openSC, lapEnd: lap })
+        openSC = { type: 'SC', lapStart: lap }
+      } else if (text.includes('IN THIS') || text.includes('WITHDRAWN') || text.includes('CLEAR') || text.includes('END')) {
+        if (openSC) { periods.push({ ...openSC, lapEnd: lap + 1 }); openSC = null }
+      }
+    }
+  }
+
+  // Safety net: cap unclosed periods — SC rarely runs more than 8 laps, VSC more than 5
+  if (openSC)  periods.push({ ...openSC,  lapEnd: openSC.lapStart  + 8 })
+  if (openVSC) periods.push({ ...openVSC, lapEnd: openVSC.lapStart + 5 })
+
+  return periods
+    .filter(p => p.lapEnd > p.lapStart)
+    .sort((a, b) => a.lapStart - b.lapStart)
 }
 
 export async function getLivePositions(sessionKey) {

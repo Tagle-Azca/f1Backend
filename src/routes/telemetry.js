@@ -8,6 +8,7 @@ import {
   getTireStrategy,
   getRacePositions,
   getTeamPace,
+  getSafetyCar,
 } from '../controllers/telemetryController.js'
 
 const router = Router()
@@ -20,5 +21,6 @@ router.get('/pace/:raceId',               getRacePace)
 router.get('/strategy/:raceId',           getTireStrategy)
 router.get('/positions/:raceId',          getRacePositions)
 router.get('/team-pace',                  getTeamPace)
+router.get('/safety-car/:raceId',         getSafetyCar)
 
 export default router

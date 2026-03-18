@@ -8,6 +8,7 @@ import {
   getLiveRacePace,
   getLiveTireStrategy,
   getLivePositions,
+  getSafetyCarPeriods,
 } from '../services/openf1Live.js'
 
 function cassandraUnavailable(res) {
@@ -88,14 +89,24 @@ export async function getLapTimes(req, res, next) {
       return res.json(await getLiveLapTimes(sessionKey, driverId))
     }
 
-    const rows = await cassandraQuery(
-      `SELECT lap_number, lap_time, sector1, sector2, sector3
-         FROM lap_times
-        WHERE race_id = ? AND driver_id = ?
-        ORDER BY lap_number ASC`,
-      [raceId, driverId]
-    )
-    res.json(rows)
+    const [lapRows, stintRows] = await Promise.all([
+      cassandraQuery(
+        `SELECT lap_number, lap_time, sector1, sector2, sector3
+           FROM lap_times
+          WHERE race_id = ? AND driver_id = ?
+          ORDER BY lap_number ASC`,
+        [raceId, driverId]
+      ),
+      cassandraQuery(
+        `SELECT compound, lap_start, lap_end FROM stints WHERE race_id = ? AND driver_id = ?`,
+        [raceId, driverId]
+      ),
+    ])
+
+    res.json(lapRows.map(r => {
+      const stint = stintRows.find(s => r.lap_number >= s.lap_start && r.lap_number <= s.lap_end)
+      return { ...r, compound: stint?.compound?.toUpperCase() || null }
+    }))
   } catch (err) { next(err) }
 }
 
@@ -258,6 +269,16 @@ export async function getRacePositions(req, res, next) {
     })
 
     res.json({ drivers: result, laps: positionsByLap, totalLaps: maxLap })
+  } catch (err) { next(err) }
+}
+
+// ── Safety Car / VSC periods ───────────────────────────────────
+
+export async function getSafetyCar(req, res, next) {
+  try {
+    const sessionKey = sessionKeyFromRaceId(req.params.raceId)
+    if (!sessionKey) return res.json([])
+    res.json(await getSafetyCarPeriods(sessionKey))
   } catch (err) { next(err) }
 }
 
