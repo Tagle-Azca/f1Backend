@@ -114,10 +114,12 @@ export async function listRaces(req, res, next) {
           }
         }
 
-        // Overlay sprint flags for upcoming MongoDB races (no results yet = arrays empty)
+        // Overlay sprint flags + detect cancelled races
         races = races.map(r => {
-          if (r.hasSprint || r.hasSprintQualifying) return r  // already flagged
           const jr = jolpicaMap.get(r.round)
+          // Race in MongoDB but gone from Jolpica calendar + no results = cancelled
+          const isCancelled = !jr && !r.hasResults
+          if (isCancelled) return { ...r, isCancelled: true }
           if (!jr) return r
           return {
             ...r,
