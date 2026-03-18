@@ -272,6 +272,43 @@ export async function getRacePositions(req, res, next) {
   } catch (err) { next(err) }
 }
 
+// ── Race info (total laps, used for DNS/DNF detection) ─────────
+
+export async function getRaceInfo(req, res, next) {
+  if (!getCassandraClient()) return cassandraUnavailable(res)
+  try {
+    const { raceId } = req.params
+    const [stintRows, posRows] = await Promise.all([
+      cassandraQuery(
+        'SELECT lap_end FROM stints WHERE race_id = ? ALLOW FILTERING',
+        [raceId]
+      ),
+      cassandraQuery(
+        'SELECT driver_id, lap FROM race_positions WHERE race_id = ? ALLOW FILTERING',
+        [raceId]
+      ),
+    ])
+
+    const valid     = stintRows.filter(r => r.lap_end != null).map(r => r.lap_end)
+    const totalLaps = valid.length ? Math.max(...valid) : null
+
+    // Build per-driver last-lap map from race positions
+    const lastLapMap = new Map()
+    for (const r of posRows) {
+      if ((lastLapMap.get(r.driver_id) ?? 0) < r.lap) lastLapMap.set(r.driver_id, r.lap)
+    }
+
+    const maxLap = posRows.length ? Math.max(...posRows.map(r => r.lap)) : (totalLaps ?? 0)
+
+    const driverStatuses = {}
+    for (const [dId, lastLap] of lastLapMap) {
+      driverStatuses[dId] = lastLap < maxLap - 1 ? 'DNF' : 'Finished'
+    }
+
+    res.json({ totalLaps, driverStatuses })
+  } catch (err) { next(err) }
+}
+
 // ── Safety Car / VSC periods ───────────────────────────────────
 
 export async function getSafetyCar(req, res, next) {
