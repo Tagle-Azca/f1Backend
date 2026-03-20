@@ -17,7 +17,7 @@ export async function getDashboard(req, res, next) {
     const today       = new Date().toISOString().slice(0, 10) // "YYYY-MM-DD"
 
     const seasonRaces = await Race.find({ season: currentYear })
-      .select('round raceName date time Circuit Results SprintResults')
+      .select('season round raceName date time Circuit Results SprintResults')
       .sort({ round: 1 })
       .lean()
 
@@ -46,7 +46,7 @@ export async function getDashboard(req, res, next) {
     if (!completedRaces.length) {
       const prevYear = String(Number(currentYear) - 1)
       const prevRaces = await Race.find({ season: prevYear })
-        .select('round raceName date time Circuit Results')
+        .select('season round raceName date time Circuit Results')
         .sort({ round: 1 })
         .lean()
       completedRaces = prevRaces.filter(r => r.Results?.length)
