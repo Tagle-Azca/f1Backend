@@ -2,21 +2,63 @@ import Race    from '../models/Race.js'
 import Circuit from '../models/Circuit.js'
 import { buildDriverName, roundPoints } from '../utils/formatters.js'
 import { cached } from '../utils/cache.js'
+import { F1_HEADERS } from '../utils/http.js'
+
+// Fetch race results from Jolpica to fill FastestLap/QualifyingResults gaps
+async function enrichFromJolpica(race) {
+  if (!race?.season || !race?.round) return
+  try {
+    const [resResp, qualiResp] = await Promise.allSettled([
+      fetch(`https://api.jolpi.ca/ergast/f1/${race.season}/${race.round}/results.json`,
+        { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) }),
+      fetch(`https://api.jolpi.ca/ergast/f1/${race.season}/${race.round}/qualifying.json`,
+        { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) }),
+    ])
+
+    // Merge FastestLap per driver if missing in MongoDB
+    const hasFastest = (race.Results || []).some(r => r.FastestLap?.Time?.time)
+    if (!hasFastest && resResp.status === 'fulfilled' && resResp.value.ok) {
+      const json = await resResp.value.json()
+      const jResults = json?.MRData?.RaceTable?.Races?.[0]?.Results || []
+      for (const result of race.Results || []) {
+        const jr = jResults.find(r => r.Driver?.driverId === result.Driver?.driverId)
+        if (jr?.FastestLap) result.FastestLap = jr.FastestLap
+      }
+    }
+
+    // Merge QualifyingResults if missing in MongoDB
+    const hasQuali = (race.QualifyingResults || []).length > 0
+    if (!hasQuali && qualiResp.status === 'fulfilled' && qualiResp.value.ok) {
+      const json = await qualiResp.value.json()
+      const jQuali = json?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults || []
+      if (jQuali.length) race.QualifyingResults = jQuali
+    }
+  } catch (_) { /* non-critical — degrade gracefully */ }
+}
 
 const STATS_TTL = 10 * 60 * 1000 // 10 min — historical data changes rarely
 
 export async function getCircuitHistory(req, res, next) {
   try {
     const { id } = req.params
-    const [circuit, races] = await Promise.all([
+    const [circuit, races, lastRace] = await Promise.all([
       Circuit.findOne({ circuitId: id }).lean(),
       Race.find({ 'Circuit.circuitId': id })
-        .select('season round raceName date Results')
+        .select('season round raceName date Results QualifyingResults')
+        .sort({ season: -1 })
+        .lean(),
+      // Full document for the most recent completed race — no .select() so every field
+      // (Results.FastestLap, QualifyingResults with Q1/Q2/Q3, grid, etc.) is guaranteed.
+      Race.findOne({ 'Circuit.circuitId': id, 'Results.0': { $exists: true } })
         .sort({ season: -1 })
         .lean(),
     ])
     if (!circuit) return res.status(404).json({ message: 'Circuit not found' })
-    res.json({ circuit, races })
+
+    // If lastRace is missing FastestLap or QualifyingResults, pull them live from Jolpica
+    if (lastRace) await enrichFromJolpica(lastRace)
+
+    res.json({ circuit, races, lastRace: lastRace || null })
   } catch (err) { next(err) }
 }
 

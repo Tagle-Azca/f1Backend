@@ -71,7 +71,7 @@ export async function getDashboard(req, res, next) {
         }))
 
       const winner = podium.find(p => p.position === 1)
-      const fastestLap = (lastRace.Results || []).find(r => r.FastestLap?.rank === '1')
+      const fastestLap = (lastRace.Results || []).find(r => r.FastestLap?.rank != null && String(r.FastestLap.rank) === '1')
 
       lastRaceData = {
         season:    lastRace.season,
