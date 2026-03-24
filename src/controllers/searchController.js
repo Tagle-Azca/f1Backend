@@ -4,9 +4,10 @@ import Race    from '../models/Race.js'
 
 export async function search(req, res, next) {
   try {
-    const { q, limit = 12 } = req.query
+    const { q, limit: rawLimit } = req.query
     if (!q || q.trim().length < 2) return res.json([])
-    const lim = Number(limit)
+    if (q.length > 100) return res.status(400).json({ message: 'Query too long' })
+    const lim = Math.min(Math.max(1, parseInt(rawLimit) || 12), 50)
 
     const regex = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
 

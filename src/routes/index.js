@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import rateLimit from 'express-rate-limit'
 import driversRouter    from './drivers.js'
 import circuitsRouter   from './circuits.js'
 import racesRouter      from './races.js'
@@ -10,11 +11,19 @@ import dashboardRouter  from './dashboard.js'
 
 const router = Router()
 
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many search requests, please slow down.' },
+})
+
 // MongoDB routes
 router.use('/drivers',   driversRouter)
 router.use('/circuits',  circuitsRouter)
 router.use('/races',     racesRouter)
-router.use('/search',    searchRouter)
+router.use('/search',    searchLimiter, searchRouter)
 router.use('/stats',     statsRouter)
 router.use('/dashboard', dashboardRouter)
 

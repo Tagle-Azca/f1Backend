@@ -1,7 +1,6 @@
 import Race    from '../models/Race.js'
 import Circuit from '../models/Circuit.js'
-
-const HEADERS = { 'User-Agent': 'F1IntelligencePlatform/1.0' }
+import { F1_HEADERS as HEADERS } from '../utils/http.js'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,9 +55,15 @@ function extractSchedule(jr) {
 export async function listRaces(req, res, next) {
   try {
     const { season }  = req.query
+    const currentYear = String(new Date().getFullYear())
+    if (season) {
+      const y = parseInt(season)
+      if (isNaN(y) || y < 1950 || y > Number(currentYear)) {
+        return res.status(400).json({ message: 'Invalid season' })
+      }
+    }
     const filter      = season ? { season } : {}
     const today       = new Date().toISOString().slice(0, 10)
-    const currentYear = String(new Date().getFullYear())
 
     // Use aggregate: avoid loading full Results arrays but still get metadata
     const mongoRaces = await Race.aggregate([
@@ -130,11 +135,42 @@ export async function listRaces(req, res, next) {
       }
     }
 
-    res.json(races.map(r => ({
-      ...r,
-      isCurrentWeekend: !r.hasResults && isCurrentWeekend(r.date, today),
-      isUpcoming: !r.hasResults && (!r.date || r.date > today),
-    })))
+    // For upcoming races, enrich with last circuit winner from MongoDB history
+    const upcomingIds = races
+      .filter(r => !r.hasResults && r.Circuit?.circuitId)
+      .map(r => r.Circuit.circuitId)
+
+    const lastWinnerMap = new Map()
+    if (upcomingIds.length) {
+      const lastWinners = await Race.aggregate([
+        { $match: { 'Circuit.circuitId': { $in: upcomingIds }, 'Results.0': { $exists: true } } },
+        { $sort: { season: -1 } },
+        { $group: {
+          _id: '$Circuit.circuitId',
+          season: { $first: '$season' },
+          winner: { $first: {
+            $arrayElemAt: [
+              { $filter: { input: '$Results', as: 'r', cond: { $eq: ['$$r.position', '1'] } } },
+              0
+            ]
+          }}
+        }}
+      ])
+      for (const lw of lastWinners) lastWinnerMap.set(lw._id, lw)
+    }
+
+    res.json(races.map(r => {
+      const base = {
+        ...r,
+        isCurrentWeekend: !r.hasResults && isCurrentWeekend(r.date, today),
+        isUpcoming: !r.hasResults && (!r.date || r.date > today),
+      }
+      if (!r.hasResults && r.Circuit?.circuitId) {
+        const lw = lastWinnerMap.get(r.Circuit.circuitId)
+        if (lw) base.lastCircuitWinner = { driver: lw.winner?.Driver, season: lw.season }
+      }
+      return base
+    }))
   } catch (err) { next(err) }
 }
 

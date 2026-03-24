@@ -2,7 +2,9 @@ import Driver from '../models/Driver.js'
 
 export async function listDrivers(req, res, next) {
   try {
-    const { nationality, search, limit = 100, skip = 0 } = req.query
+    const { nationality, search, limit: rawLimit, skip: rawSkip } = req.query
+    const limit = Math.min(Math.max(1, parseInt(rawLimit) || 100), 500)
+    const skip  = Math.max(0, parseInt(rawSkip) || 0)
     const filter = {}
     if (nationality) filter.nationality = nationality
     if (search) {
@@ -13,8 +15,8 @@ export async function listDrivers(req, res, next) {
     }
     const drivers = await Driver.find(filter)
       .sort({ familyName: 1 })
-      .limit(Number(limit))
-      .skip(Number(skip))
+      .limit(limit)
+      .skip(skip)
       .lean()
     res.json(drivers)
   } catch (err) { next(err) }

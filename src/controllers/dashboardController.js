@@ -3,6 +3,7 @@ import Driver from '../models/Driver.js'
 import { getLastSessionSnapshot, getF1LiveClassification, saveSessionSnapshot } from '../services/f1LiveTiming.js'
 import { fetchLastSession } from '../services/lastSessionService.js'
 import { buildDriverName, roundPoints } from '../utils/formatters.js'
+import { F1_HEADERS } from '../utils/http.js'
 
 // Standard F1 points tables
 const RACE_POINTS   = { 1:25, 2:18, 3:15, 4:12, 5:10, 6:8, 7:6, 8:4, 9:2, 10:1 }
@@ -28,7 +29,7 @@ export async function getDashboard(req, res, next) {
       try {
         const resp = await fetch(
           `https://api.jolpi.ca/ergast/f1/${currentYear}/races.json?limit=100`,
-          { headers: { 'User-Agent': 'F1IntelligencePlatform/1.0' }, signal: AbortSignal.timeout(4000) }
+          { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) }
         )
         if (resp.ok) {
           const json = await resp.json()
@@ -125,7 +126,7 @@ export async function getDashboard(req, res, next) {
       let schedule = null
       try {
         const jolpica = `https://api.jolpi.ca/ergast/f1/${nextRace.season}/${nextRace.round}.json`
-        const resp    = await fetch(jolpica, { headers: { 'User-Agent': 'F1IntelligencePlatform/1.0' }, signal: AbortSignal.timeout(4000) })
+        const resp    = await fetch(jolpica, { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) })
         if (resp.ok) {
           const json  = await resp.json()
           const race  = json?.MRData?.RaceTable?.Races?.[0]

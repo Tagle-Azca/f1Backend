@@ -2,6 +2,7 @@ import cassandra from 'cassandra-driver'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import logger from '../utils/logger.js'
 
 let client = null
 
@@ -34,9 +35,9 @@ export async function connectCassandra() {
     }
 
     await client.connect()
-    console.log('[Cassandra] Connected')
+    logger.info('[Cassandra] Connected')
   } catch (err) {
-    console.error('[Cassandra] Connection error:', err.message)
+    logger.error('[Cassandra] Connection error: ' + err.message)
     client = null
   }
 }

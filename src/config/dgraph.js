@@ -1,5 +1,6 @@
 import dgraph from 'dgraph-js'
 import grpc from '@grpc/grpc-js'
+import logger from '../utils/logger.js'
 
 let dgraphClient = null
 
@@ -31,9 +32,9 @@ export async function connectDgraph() {
     await txn.query('{ q(func: has(dgraph.type), first: 1) { uid } }')
     await txn.discard()
     dgraphClient = client
-    console.log('[Dgraph] Connected:', url)
+    logger.info('[Dgraph] Connected: ' + url)
   } catch (err) {
-    console.error('[Dgraph] Connection error:', err.message)
+    logger.error('[Dgraph] Connection error: ' + err.message)
     dgraphClient = null
   }
 }
