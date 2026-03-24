@@ -14,6 +14,8 @@ const DriverSchema = new mongoose.Schema({
 }, { timestamps: true })
 
 DriverSchema.index({ familyName: 1 })
+DriverSchema.index({ givenName: 1 })
 DriverSchema.index({ nationality: 1 })
+DriverSchema.index({ givenName: 'text', familyName: 'text' })
 
 export default mongoose.model('Driver', DriverSchema)

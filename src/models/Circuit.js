@@ -14,6 +14,9 @@ const CircuitSchema = new mongoose.Schema({
   trackFetched: { type: Boolean, default: false },
 }, { timestamps: true })
 
+CircuitSchema.index({ circuitName: 1 })
 CircuitSchema.index({ 'Location.country': 1 })
+CircuitSchema.index({ 'Location.locality': 1 })
+CircuitSchema.index({ circuitName: 'text', 'Location.country': 'text', 'Location.locality': 'text' })
 
 export default mongoose.model('Circuit', CircuitSchema)
