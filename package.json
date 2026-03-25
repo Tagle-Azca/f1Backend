@@ -1,5 +1,5 @@
 {
-  "name": "f1db-back",
+  "name": "pitwall-back",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
@@ -19,12 +19,15 @@
     "init": "npm run db:up && npm run seed"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cassandra-driver": "^4.7.2",
     "cors": "^2.8.5",
     "dgraph-js": "^21.3.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^8.3.1",
+    "google-auth-library": "^10.6.2",
+    "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.3.0",
     "pino": "^10.3.1",
     "pino-pretty": "^13.1.3",

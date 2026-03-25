@@ -74,15 +74,30 @@ export async function listRaces(req, res, next) {
         hasSprint:           { $gt: [{ $size: { $ifNull: ['$SprintResults', []] } }, 0] },
         hasSprintQualifying: { $gt: [{ $size: { $ifNull: ['$SprintQualifyingResults', []] } }, 0] },
         // P1 winner for display in list
+        // Sprint weekends: Results = main race, SprintResults = sprint race.
+        // We want the main race P1; fall back to SprintResults P1 if Results empty.
         winner: {
-          $arrayElemAt: [
-            { $filter: {
-              input: { $ifNull: ['$Results', []] },
-              as: 'r',
-              cond: { $eq: ['$$r.position', '1'] }
-            }},
-            0
-          ]
+          $let: {
+            vars: {
+              raceP1: {
+                $arrayElemAt: [
+                  { $filter: {
+                    input: { $ifNull: ['$Results', []] },
+                    as: 'r', cond: { $eq: ['$$r.position', '1'] }
+                  }}, 0
+                ]
+              },
+              sprintP1: {
+                $arrayElemAt: [
+                  { $filter: {
+                    input: { $ifNull: ['$SprintResults', []] },
+                    as: 'r', cond: { $eq: ['$$r.position', '1'] }
+                  }}, 0
+                ]
+              }
+            },
+            in: { $ifNull: ['$$raceP1', '$$sprintP1'] }
+          }
         }
       }},
       { $addFields: { _roundNum: { $toInt: '$round' } } },
