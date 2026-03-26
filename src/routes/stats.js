@@ -1,11 +1,12 @@
 import { Router } from 'express'
-import { getDriverStats, getDriverCircuits, getDriverSeasons, getHistoricalPerformance } from '../controllers/driverStatsController.js'
+import { getDriverStats, getDriverCircuits, getDriverSeasons, getHistoricalPerformance, getDriverNetwork } from '../controllers/driverStatsController.js'
 import { getSeasonStandings, getConstructorStandings, getSeasonDrivers } from '../controllers/standingsController.js'
 import { getCircuitHistory, getConstructorStats } from '../controllers/constructorStatsController.js'
 
 const router = Router()
 router.get('/driver/:id',                    getDriverStats)
 router.get('/driver/:id/seasons',            getDriverSeasons)
+router.get('/driver/:id/network',            getDriverNetwork)
 router.get('/driver/:id/circuits',           getDriverCircuits)
 router.get('/circuit/:id',                   getCircuitHistory)
 router.get('/standings/:season',             getSeasonStandings)

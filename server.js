@@ -7,6 +7,7 @@ import { connectCassandra } from './src/config/cassandra.js'
 import { connectDgraph }   from './src/config/dgraph.js'
 import routes from './src/routes/index.js'
 import { startF1LiveTiming, scheduleConnect } from './src/services/f1LiveTiming.js'
+import { scheduleAutoSeed } from './src/services/autoSeedService.js'
 import logger from './src/utils/logger.js'
 
 const app  = express()
@@ -87,6 +88,8 @@ async function refreshF1Schedule() {
     } else {
       logger.info('[F1Schedule] no upcoming sessions found for this season')
     }
+
+    scheduleAutoSeed(races)
   } catch (e) {
     logger.warn('[F1Schedule] failed to fetch schedule:', e.message)
   }

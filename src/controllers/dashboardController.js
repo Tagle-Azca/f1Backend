@@ -53,12 +53,67 @@ export async function getDashboard(req, res, next) {
       completedRaces = prevRaces.filter(r => r.Results?.length)
     }
 
-    const lastRace = completedRaces[completedRaces.length - 1] || null
+    const lastMongoRace = completedRaces[completedRaces.length - 1] || null
+
+    // Check the Jolpica calendar (already fetched above) for races that have passed
+    // but whose results haven't been imported into MongoDB yet (e.g. race was yesterday).
+    // jolpicaAllRaces may be null if the fetch was skipped (seasonRaces.length >= 18),
+    // so ensure we have it for this check.
+    let calendarForGapCheck = jolpicaAllRaces
+    if (!calendarForGapCheck) {
+      try {
+        const r = await fetch(
+          `https://api.jolpi.ca/ergast/f1/${currentYear}/races.json?limit=100`,
+          { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) }
+        )
+        if (r.ok) {
+          const j = await r.json()
+          calendarForGapCheck = j?.MRData?.RaceTable?.Races || []
+        }
+      } catch (_) { /* non-critical */ }
+    }
+
+    const jolpicaLastCompleted = (calendarForGapCheck || [])
+      .filter(r => r.date && r.date <= today)
+      .sort((a, b) => parseInt(b.round) - parseInt(a.round))[0]
+
+    let lastRace = lastMongoRace
+    let lastRaceFromJolpica = null
+
+    // If Jolpica knows of a more recent completed race than what's in MongoDB, fetch its results
+    if (jolpicaLastCompleted &&
+        (!lastMongoRace || parseInt(jolpicaLastCompleted.round) > parseInt(lastMongoRace.round))) {
+      try {
+        const resp = await fetch(
+          `https://api.jolpi.ca/ergast/f1/${currentYear}/${jolpicaLastCompleted.round}/results.json`,
+          { headers: F1_HEADERS, signal: AbortSignal.timeout(5000) }
+        )
+        if (resp.ok) {
+          const json = await resp.json()
+          lastRaceFromJolpica = json?.MRData?.RaceTable?.Races?.[0] || null
+        }
+      } catch (_) { /* non-critical, fall back to MongoDB */ }
+    }
+
+    if (lastRaceFromJolpica) lastRace = lastRaceFromJolpica
 
     let lastRaceData = null
     if (lastRace) {
-      const podium = (lastRace.Results || [])
-        .filter(r => ['1','2','3'].includes(r.position))
+      // Jolpica shape uses Results[].Driver/Constructor directly; MongoDB shape is identical
+      const results = lastRaceFromJolpica
+        ? (lastRaceFromJolpica.Results || []).map(r => ({
+            position:      r.position,
+            Driver:        r.Driver,
+            Constructor:   r.Constructor,
+            points:        r.points,
+            Time:          r.Time,
+            status:        r.status,
+            FastestLap:    r.FastestLap,
+          }))
+        : (lastRace.Results || [])
+
+      const podium = results
+        .filter(r => ['1','2','3'].includes(String(r.position)))
         .sort((a, b) => Number(a.position) - Number(b.position))
         .map(r => ({
           position:    Number(r.position),
@@ -71,17 +126,19 @@ export async function getDashboard(req, res, next) {
         }))
 
       const winner = podium.find(p => p.position === 1)
-      const fastestLap = (lastRace.Results || []).find(r => r.FastestLap?.rank != null && String(r.FastestLap.rank) === '1')
+      const fastestLap = results.find(r => r.FastestLap?.rank != null && String(r.FastestLap.rank) === '1')
+
+      const circuit = lastRaceFromJolpica ? lastRaceFromJolpica.Circuit : lastRace.Circuit
 
       lastRaceData = {
-        season:    lastRace.season,
-        round:     lastRace.round,
-        raceName:  lastRace.raceName,
-        date:      lastRace.date,
-        circuit:   lastRace.Circuit?.circuitName || '',
-        circuitId: lastRace.Circuit?.circuitId   || '',
-        locality:  lastRace.Circuit?.Location?.locality || '',
-        country:   lastRace.Circuit?.Location?.country  || '',
+        season:    lastRaceFromJolpica ? lastRaceFromJolpica.season : lastRace.season,
+        round:     lastRaceFromJolpica ? lastRaceFromJolpica.round  : lastRace.round,
+        raceName:  lastRaceFromJolpica ? lastRaceFromJolpica.raceName : lastRace.raceName,
+        date:      lastRaceFromJolpica ? lastRaceFromJolpica.date   : lastRace.date,
+        circuit:   circuit?.circuitName || circuit?.CircuitName || '',
+        circuitId: circuit?.circuitId   || '',
+        locality:  circuit?.Location?.locality || '',
+        country:   circuit?.Location?.country  || '',
         podium,
         winner:    winner || null,
         fastestLap: fastestLap ? {
