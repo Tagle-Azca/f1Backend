@@ -3,6 +3,7 @@ import Circuit from '../models/Circuit.js'
 import { buildDriverName, roundPoints } from '../utils/formatters.js'
 import { cached } from '../utils/cache.js'
 import { F1_HEADERS } from '../utils/http.js'
+import { cassandraQuery, getCassandraClient } from '../config/cassandra.js'
 
 // Fetch race results from Jolpica to fill FastestLap/QualifyingResults gaps
 async function enrichFromJolpica(race) {
@@ -58,7 +59,24 @@ export async function getCircuitHistory(req, res, next) {
     // If lastRace is missing FastestLap or QualifyingResults, pull them live from Jolpica
     if (lastRace) await enrichFromJolpica(lastRace)
 
-    res.json({ circuit, races, lastRace: lastRace || null })
+    // Look up the real Cassandra race_id (format: year_sessionKey) for the last race
+    let cassandraRaceId = null
+    if (lastRace && getCassandraClient()) {
+      try {
+        const rows = await cassandraQuery(
+          'SELECT race_id, race_name FROM race_meta WHERE year = ? ALLOW FILTERING',
+          [parseInt(lastRace.season)]
+        )
+        const needle = (lastRace.raceName || '').toLowerCase().replace(' grand prix', '').trim()
+        const match  = rows.find(r => {
+          const hay = (r.race_name || '').toLowerCase().replace(' grand prix', '').trim()
+          return hay === needle || hay.includes(needle) || needle.includes(hay)
+        })
+        if (match) cassandraRaceId = match.race_id
+      } catch {}
+    }
+
+    res.json({ circuit, races, lastRace: lastRace || null, cassandraRaceId })
   } catch (err) { next(err) }
 }
 
