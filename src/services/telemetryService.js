@@ -1,14 +1,20 @@
 import {
   sessionKeyFromRaceId,
   findLiveRaceSession,
+  findLiveSession,
   getLiveDrivers,
   getLiveLapTimes,
   getLivePitStops,
   getLiveRacePace,
   getLiveTireStrategy,
   getLivePositions,
+  getLiveTimingTower,
   getSafetyCarPeriods,
 } from './openf1Live.js'
+import {
+  getF1LiveClassification,
+  isF1LiveConnected,
+} from './f1LiveTiming.js'
 import * as repo from '../repositories/telemetryRepository.js'
 
 // ── Available races ────────────────────────────────────────────────────────────
@@ -224,6 +230,59 @@ export async function getTireStrategy(raceId) {
       }
     })
     .sort((a, b) => a.acronym.localeCompare(b.acronym))
+}
+
+// ── Live timing tower ─────────────────────────────────────────────────────────
+
+export async function getTimingTower() {
+  // Primary: F1 official SignalR feed (real-time, sector colors from F1 itself)
+  if (isF1LiveConnected()) {
+    const live = getF1LiveClassification()
+    if (live?.classification?.length) {
+      const drivers = live.classification.map(d => ({
+        position:   d.position,
+        driverNum:  d.driverNum,
+        acronym:    d.acronym,
+        teamName:   d.teamName,
+        teamColor:  d.teamColor,
+        bestLapStr: d.bestLap   || null,
+        gapStr:     d.statLabel === 'gap'
+          ? (d.stat || 'LEADER')
+          : (d.statLabel || 'LEADER'),
+        inPit:      d.inPit     || false,
+        retired:    d.retired   || false,
+        s1: d.sectors?.[0]?.value ? { time: d.sectors[0].value, color: d.sectors[0].status } : null,
+        s2: d.sectors?.[1]?.value ? { time: d.sectors[1].value, color: d.sectors[1].status } : null,
+        s3: d.sectors?.[2]?.value ? { time: d.sectors[2].value, color: d.sectors[2].status } : null,
+      }))
+      return {
+        source:      'f1live',
+        sessionName: live.sessionName,
+        raceName:    live.raceName,
+        isRaceType:  live.isRaceType,
+        trackStatus: live.trackStatus,
+        currentLap:  live.currentLap,
+        totalLaps:   live.totalLaps,
+        updatedAt:   new Date().toISOString(),
+        drivers,
+      }
+    }
+  }
+
+  // Fallback: OpenF1 polling (available once F1 live feed connects ~15min before session)
+  const session = await findLiveSession()
+  if (!session) return null
+  const drivers = await getLiveTimingTower(session.sessionKey, session.isRaceType)
+  if (!drivers) return null
+  return {
+    source:      'openf1',
+    sessionKey:  session.sessionKey,
+    sessionName: session.sessionName,
+    raceName:    session.raceName,
+    isRaceType:  session.isRaceType,
+    updatedAt:   new Date().toISOString(),
+    drivers,
+  }
 }
 
 // ── Team pace ─────────────────────────────────────────────────────────────────

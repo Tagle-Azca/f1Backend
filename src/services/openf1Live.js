@@ -116,10 +116,17 @@ export async function findLiveSession() {
     })
 
     for (const s of sorted) {
-      const diff   = now - new Date(s.date_start).getTime()
-      if (diff < 0) continue
-      const maxDur = SESSION_MAX_DURATION[s.session_name] || 90 * 60 * 1000
-      if (diff <= maxDur) {
+      const start = new Date(s.date_start).getTime()
+      if (now < start) continue  // hasn't started
+
+      // Prefer date_end from OpenF1; fall back to estimated max duration
+      const end = s.date_end
+        ? new Date(s.date_end).getTime()
+        : start + (SESSION_MAX_DURATION[s.session_name] || 90 * 60 * 1000)
+
+      console.log(`[Live]   ${s.session_name} key=${s.session_key} end=${s.date_end || 'estimated'} → ${now <= end ? 'LIVE' : 'ended'}`)
+
+      if (now <= end) {
         return {
           sessionKey:  s.session_key,
           sessionName: s.session_name,
@@ -233,6 +240,106 @@ export async function getLiveTop3(sessionKey, isRaceType) {
 
     return { top3, currentLap: null }
   }
+}
+
+// ── Short-lived cache for live timing (5 s TTL) ──────────────
+
+const ttlCache = new Map() // key → { data, expiresAt }
+
+async function ttlFetch(key, path, ttlMs = 5000) {
+  const hit = ttlCache.get(key)
+  if (hit && Date.now() < hit.expiresAt) return hit.data
+  const data = await of1Fetch(path)
+  ttlCache.set(key, { data, expiresAt: Date.now() + ttlMs })
+  return data
+}
+
+function fmtLap(sec) {
+  if (!sec) return null
+  const m = Math.floor(sec / 60)
+  const s = (sec % 60).toFixed(3).padStart(6, '0')
+  return `${m}:${s}`
+}
+
+/**
+ * Full timing tower for FP / Qualifying / Race.
+ * Returns sector color coding: 'purple' (session best), 'green' (personal best), 'yellow'.
+ */
+export async function getLiveTimingTower(sessionKey, isRaceType) {
+  const [laps, stints, drivers] = await Promise.all([
+    ttlFetch(`laps:${sessionKey}`,    `/laps?session_key=${sessionKey}`),
+    ttlFetch(`stints:${sessionKey}`,  `/stints?session_key=${sessionKey}`),
+    ttlFetch(`drivers:${sessionKey}`, `/drivers?session_key=${sessionKey}`),
+  ])
+
+  const driverMap = new Map(drivers.map(d => [d.driver_number, d]))
+
+  // ── Best sectors per driver + session bests ───────────────
+  const bestPerDriver = new Map() // num → { lap, s1, s2, s3, lapCount }
+  let sessionBestS1 = Infinity, sessionBestS2 = Infinity, sessionBestS3 = Infinity
+
+  for (const l of laps) {
+    if (!l.lap_duration || l.lap_duration > 200) continue
+    const num = l.driver_number
+    const cur = bestPerDriver.get(num) || { lap: Infinity, s1: Infinity, s2: Infinity, s3: Infinity, lapCount: 0 }
+
+    if (l.lap_duration < cur.lap) cur.lap = l.lap_duration
+    if (l.duration_sector_1 && l.duration_sector_1 < cur.s1) cur.s1 = l.duration_sector_1
+    if (l.duration_sector_2 && l.duration_sector_2 < cur.s2) cur.s2 = l.duration_sector_2
+    if (l.duration_sector_3 && l.duration_sector_3 < cur.s3) cur.s3 = l.duration_sector_3
+    cur.lapCount++
+    bestPerDriver.set(num, cur)
+
+    if (l.duration_sector_1 && l.duration_sector_1 < sessionBestS1) sessionBestS1 = l.duration_sector_1
+    if (l.duration_sector_2 && l.duration_sector_2 < sessionBestS2) sessionBestS2 = l.duration_sector_2
+    if (l.duration_sector_3 && l.duration_sector_3 < sessionBestS3) sessionBestS3 = l.duration_sector_3
+  }
+
+  if (!bestPerDriver.size) return null
+
+  // ── Current compound per driver (latest stint) ────────────
+  const compoundMap = new Map()
+  for (const s of stints) {
+    const cur = compoundMap.get(s.driver_number)
+    if (!cur || s.stint_number > cur.stint_number) compoundMap.set(s.driver_number, s)
+  }
+
+  // ── Sort by best lap, build result ────────────────────────
+  const sorted = [...bestPerDriver.entries()]
+    .sort((a, b) => a[1].lap - b[1].lap)
+
+  const leaderTime = sorted[0]?.[1]?.lap
+
+  const sectorColor = (driverBest, sessionBest) => {
+    if (!driverBest || driverBest === Infinity) return null
+    if (Math.abs(driverBest - sessionBest) < 0.001) return 'purple'
+    return 'green'
+  }
+
+  const result = sorted.map(([num, best], i) => {
+    const d       = driverMap.get(num) || {}
+    const stint   = compoundMap.get(num)
+    const gap     = i === 0 ? null : +(best.lap - leaderTime).toFixed(3)
+
+    return {
+      position:    i + 1,
+      driverNum:   num,
+      acronym:     d.name_acronym || String(num),
+      teamName:    d.team_name    || '',
+      teamColor:   d.team_colour  ? `#${d.team_colour}` : null,
+      compound:    stint ? (stint.compound || 'UNKNOWN').toUpperCase() : null,
+      laps:        best.lapCount,
+      bestLap:     best.lap,
+      bestLapStr:  fmtLap(best.lap),
+      gap,
+      gapStr:      gap === null ? 'LEADER' : `+${gap.toFixed(3)}`,
+      s1: best.s1 < Infinity ? { time: +best.s1.toFixed(3), color: sectorColor(best.s1, sessionBestS1) } : null,
+      s2: best.s2 < Infinity ? { time: +best.s2.toFixed(3), color: sectorColor(best.s2, sessionBestS2) } : null,
+      s3: best.s3 < Infinity ? { time: +best.s3.toFixed(3), color: sectorColor(best.s3, sessionBestS3) } : null,
+    }
+  })
+
+  return result
 }
 
 // ── Per-endpoint live fetchers ────────────────────────────────

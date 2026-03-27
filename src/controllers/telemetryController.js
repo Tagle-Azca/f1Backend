@@ -58,6 +58,10 @@ export const getTireStrategy = requiresCassandra(async (req, res, next) => {
   try { res.json(await telemetry.getTireStrategy(req.params.raceId)) } catch (err) { next(err) }
 })
 
+export async function getTimingTower(req, res, next) {
+  try { res.json(await telemetry.getTimingTower()) } catch (err) { next(err) }
+}
+
 export const getTeamPace = requiresCassandra(async (req, res, next) => {
   try {
     const { teamName, year, raceId } = req.query

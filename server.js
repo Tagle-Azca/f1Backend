@@ -6,7 +6,7 @@ import { connectMongo }    from './src/config/mongodb.js'
 import { connectCassandra } from './src/config/cassandra.js'
 import { connectDgraph }   from './src/config/dgraph.js'
 import routes from './src/routes/index.js'
-import { startF1LiveTiming, scheduleConnect } from './src/services/f1LiveTiming.js'
+import { startF1LiveTiming, scheduleConnect, isF1LiveConnected } from './src/services/f1LiveTiming.js'
 import { scheduleAutoSeed } from './src/services/autoSeedService.js'
 import logger from './src/utils/logger.js'
 
@@ -31,6 +31,12 @@ app.use('/api', routes)
 
 // ── Health check ─────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }))
+
+// ── Admin: force F1Live reconnect (for schedule mismatches) ──
+app.post('/admin/f1live/connect', (_req, res) => {
+  scheduleConnect(new Date(Date.now() - 1).toISOString())
+  res.json({ ok: true, message: 'F1Live connection triggered' })
+})
 
 // ── Error handler ────────────────────────────────────────
 app.use((err, _req, res, _next) => {
@@ -58,6 +64,8 @@ async function start() {
 // ── F1 schedule refresh ──────────────────────────────────
 const JOLPICA_SCHEDULE = 'https://api.jolpi.ca/ergast/f1/current.json'
 
+const SESSION_MAX_MS = 3 * 60 * 60_000  // 3h generous window per session
+
 async function refreshF1Schedule() {
   try {
     const res  = await fetch(JOLPICA_SCHEDULE, { signal: AbortSignal.timeout(10_000) })
@@ -78,9 +86,23 @@ async function refreshF1Schedule() {
       add(r.date,                 r.time)
     }
 
-    const next = times
-      .map(t => new Date(t))
-      .filter(d => !isNaN(d) && d.getTime() > now)
+    const allDates = times.map(t => new Date(t)).filter(d => !isNaN(d))
+
+    // Connect now if a session is currently within its window (schedule times can be off)
+    const currentlyLive = allDates.find(d => {
+      const diff = now - d.getTime()
+      return diff >= 0 && diff <= SESSION_MAX_MS
+    })
+
+    if (currentlyLive && !isF1LiveConnected()) {
+      logger.info(`[F1Schedule] session in progress (started ${Math.round((now - currentlyLive) / 60000)}min ago) — connecting now`)
+      scheduleConnect(new Date(now - 1).toISOString())  // triggers immediate connect
+      scheduleAutoSeed(races)
+      return
+    }
+
+    const next = allDates
+      .filter(d => d.getTime() > now)
       .sort((a, b) => a - b)[0]
 
     if (next) {

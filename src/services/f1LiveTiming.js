@@ -47,22 +47,34 @@ function sessionKey() {
   return `${s.Meeting?.Name || ''}|${s.Name || s.Type || ''}`
 }
 
-function saveSnapshot() {
+/**
+ * @param {boolean} final - true only when session actually ends (ws close / session change).
+ *   Periodic live snapshots pass false so getF1LiveClassification() keeps returning data.
+ */
+function saveSnapshot(final = false) {
   const key  = sessionKey()
   if (!key) return
-  if (archivedSessionKey === key) return  // already saved for this session
+  if (archivedSessionKey === key) return  // already archived
+
+  // For live snapshot: read state directly without going through getF1LiveClassification
+  // (which would return null if already archived)
+  const { SessionInfo, DriverList, TimingData, LapCount, TrackStatus } = state
+  if (!SessionInfo || !DriverList || !TimingData?.Lines) return
 
   const full = getF1LiveClassification()
   if (!full) return
 
-  archivedSessionKey = key
   const top3data = getF1LiveTop3()
   lastSessionSnapshot = {
     ...full,
     top3: top3data?.top3 || full.classification.slice(0, 5),
     savedAt: new Date().toISOString(),
   }
-  console.log(`[F1Live] snapshot saved: ${full.sessionName} — ${full.raceName} (${full.classification.length} drivers)`)
+
+  if (final) {
+    archivedSessionKey = key
+    console.log(`[F1Live] snapshot final: ${full.sessionName} — ${full.raceName} (${full.classification.length} drivers)`)
+  }
 }
 
 let ws           = null
@@ -170,12 +182,12 @@ function handleMessage(raw) {
       const [topic, data] = m.A || []
       if (!topic) continue
 
-      // Detect session change: save snapshot before overwriting SessionInfo
+      // Detect session change: archive snapshot before overwriting SessionInfo
       if (topic === 'SessionInfo' && data && state.SessionInfo) {
         const oldName = state.SessionInfo.Name || state.SessionInfo.Type || ''
         const newName = data.Name || data.Type || ''
         if (newName && oldName && newName !== oldName) {
-          saveSnapshot()
+          saveSnapshot(true)  // final — session is ending
         }
       }
 
@@ -257,7 +269,7 @@ async function connectWs() {
 
   sock.on('close', (code, reason) => {
     connected = false
-    try { saveSnapshot() } catch (e) { console.error('[F1Live] saveSnapshot error on close:', e.message) }
+    try { saveSnapshot(true) } catch (e) { console.error('[F1Live] saveSnapshot error on close:', e.message) }
     state     = { SessionInfo: null, DriverList: null, TimingData: null, LapCount: null, TrackStatus: null }
     console.log(`[F1Live] disconnected (${code})`, reason?.toString() || '')
     scheduleReconnect()
