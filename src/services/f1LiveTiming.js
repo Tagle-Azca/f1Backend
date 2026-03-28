@@ -11,11 +11,13 @@
  */
 
 import WebSocket from 'ws'
+import zlib from 'zlib'
+import { clearLiveSessionCache } from './openf1Live.js'
 
 const BASE        = 'https://livetiming.formula1.com'
 const WS_BASE     = 'wss://livetiming.formula1.com'
 const HUB         = 'Streaming'
-const TOPICS      = ['SessionInfo', 'DriverList', 'TimingData', 'LapCount', 'TrackStatus']
+const TOPICS      = ['SessionInfo', 'DriverList', 'TimingData', 'TimingAppData', 'CarData.z', 'LapCount', 'TrackStatus']
 const RECONNECT_DELAY = 5_000   // ms before reconnect attempt
 const MAX_RECONNECTS  = 0       // 0 = unlimited
 
@@ -29,11 +31,19 @@ const RACE_TYPES = new Set(['Race', 'Sprint'])
 
 // ── In-memory state ─────────────────────────────────────────────────────────
 let state = {
-  SessionInfo:  null,
-  DriverList:   null,
-  TimingData:   null,
-  LapCount:     null,
-  TrackStatus:  null,
+  SessionInfo:   null,
+  DriverList:    null,
+  TimingData:    null,
+  TimingAppData: null,  // current compound per driver
+  CarData:       null,  // latest throttle/brake/speed per driver (decoded from CarData.z)
+  LapCount:      null,
+  TrackStatus:   null,
+}
+
+function decompressZ(b64) {
+  try {
+    return JSON.parse(zlib.inflateRawSync(Buffer.from(b64, 'base64')).toString())
+  } catch { return null }
 }
 
 // Snapshot of the most recently completed session (survives session transitions)
@@ -74,6 +84,9 @@ function saveSnapshot(final = false) {
   if (final) {
     archivedSessionKey = key
     console.log(`[F1Live] snapshot final: ${full.sessionName} — ${full.raceName} (${full.classification.length} drivers)`)
+    if (onFinalSnapshot) {
+      try { onFinalSnapshot(lastSessionSnapshot) } catch (e) { console.error('[F1Live] onFinalSnapshot error:', e.message) }
+    }
   }
 }
 
@@ -82,6 +95,18 @@ let connected    = false
 let reconnecting = false
 let reconnectCount = 0
 let connectTimer = null   // handle for scheduled future connection
+
+/** Timestamp (ms) when we first received live session data — used to auto-expire stale live sessions */
+let sessionDataStartTime = null
+const SESSION_MAX_LIVE_MS = 70 * 60_000  // 1h10m — auto-archive if F1 keeps signaling "live" after this
+
+/** Called once a session is fully archived — allows server.js to schedule the next session */
+let onSessionArchived  = null
+export function setOnSessionArchived(fn) { onSessionArchived = fn }
+
+/** Called with the final snapshot object so server.js can persist it to MongoDB */
+let onFinalSnapshot = null
+export function setOnFinalSnapshot(fn) { onFinalSnapshot = fn }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function parseLapTime(str) {
@@ -164,15 +189,22 @@ function handleMessage(raw) {
   if (msg.R && typeof msg.R === 'object') {
     let populated = []
     for (const [topic, data] of Object.entries(msg.R)) {
-      if (!data || !TOPICS.includes(topic)) continue
-      if (topic === 'TimingData') {
-        state.TimingData = deepMerge(state.TimingData || {}, data)
-      } else {
+      if (!data) continue
+      if (topic === 'TimingData' || topic === 'TimingAppData') {
+        state[topic] = deepMerge(state[topic] || {}, data)
+        populated.push(topic)
+      } else if (TOPICS.includes(topic)) {
         state[topic] = data
+        populated.push(topic)
       }
-      populated.push(topic)
     }
-    if (populated.length) console.log('[F1Live] initial state loaded:', populated.join(', '))
+    if (populated.length) {
+      console.log('[F1Live] initial state loaded:', populated.join(', '))
+      if (!sessionDataStartTime) {
+        sessionDataStartTime = Date.now()
+        console.log('[F1Live] session data clock started')
+      }
+    }
   }
 
   // Data messages from hub
@@ -180,22 +212,28 @@ function handleMessage(raw) {
     for (const m of msg.M) {
       if (m.H !== HUB || m.M !== 'feed') continue
       const [topic, data] = m.A || []
-      if (!topic) continue
+      if (!topic || data == null) continue
 
       // Detect session change: archive snapshot before overwriting SessionInfo
       if (topic === 'SessionInfo' && data && state.SessionInfo) {
         const oldName = state.SessionInfo.Name || state.SessionInfo.Type || ''
         const newName = data.Name || data.Type || ''
         if (newName && oldName && newName !== oldName) {
-          saveSnapshot(true)  // final — session is ending
+          saveSnapshot(true)
         }
       }
 
-      if (topic === 'TimingData' || topic === 'DriverList') {
-        // Both send partial patches — deep merge into existing state
+      if (topic === 'CarData.z') {
+        const decoded = decompressZ(data)
+        const entries = decoded?.Entries || []
+        if (entries.length) {
+          // Keep only the latest reading per car (merge new channels into existing)
+          const latest = entries[entries.length - 1].Cars || {}
+          state.CarData = deepMerge(state.CarData || {}, latest)
+        }
+      } else if (topic === 'TimingData' || topic === 'TimingAppData' || topic === 'DriverList') {
         state[topic] = deepMerge(state[topic] || {}, data)
       } else {
-        // SessionInfo, LapCount, TrackStatus are replaced wholesale
         state[topic] = data
       }
     }
@@ -220,6 +258,7 @@ async function connectWs() {
     ;(async () => {
       connected = true
       reconnectCount = 0
+      clearLiveSessionCache()  // F1Live takes priority, OpenF1 cache no longer relevant
       console.log('[F1Live] connected to livetiming.formula1.com')
 
       // SignalR 1.5 /start confirmation — retry once with fresh negotiate if it fails
@@ -249,10 +288,21 @@ async function connectWs() {
         return
       }
 
-      // Periodically save a snapshot while a session is active (every 30s)
+      // Periodically save a snapshot and enforce max session duration (every 30s)
       const snapshotInterval = setInterval(() => {
         try {
-          if (state.SessionInfo && state.TimingData?.Lines) saveSnapshot()
+          if (!state.SessionInfo || !state.TimingData?.Lines) return
+
+          // Auto-archive if session has been "live" longer than SESSION_MAX_LIVE_MS
+          const elapsed = sessionDataStartTime ? Date.now() - sessionDataStartTime : 0
+          if (elapsed > SESSION_MAX_LIVE_MS) {
+            const mins = Math.round(elapsed / 60_000)
+            console.log(`[F1Live] session exceeded ${mins}min limit — auto-archiving as completed`)
+            saveSnapshot(true)
+            return
+          }
+
+          saveSnapshot()
         } catch (e) {
           console.error('[F1Live] snapshot interval error:', e.message)
         }
@@ -269,8 +319,10 @@ async function connectWs() {
 
   sock.on('close', (code, reason) => {
     connected = false
+    sessionDataStartTime = null
+    clearLiveSessionCache()  // allow OpenF1 to recheck now that F1Live dropped
     try { saveSnapshot(true) } catch (e) { console.error('[F1Live] saveSnapshot error on close:', e.message) }
-    state     = { SessionInfo: null, DriverList: null, TimingData: null, LapCount: null, TrackStatus: null }
+    state     = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, LapCount: null, TrackStatus: null }
     console.log(`[F1Live] disconnected (${code})`, reason?.toString() || '')
     scheduleReconnect()
   })
@@ -284,9 +336,10 @@ async function connectWs() {
 }
 
 function scheduleReconnect() {
-  // If a session was archived, don't loop — wait for scheduleConnect() to fire
+  // If a session was archived, notify server.js to schedule the next session
   if (archivedSessionKey) {
-    console.log('[F1Live] session archived, standing by until next session')
+    console.log('[F1Live] session archived, requesting next session schedule')
+    if (onSessionArchived) setTimeout(onSessionArchived, 2_000)  // small delay so snapshot is ready
     return
   }
   if (reconnecting) return
@@ -311,6 +364,8 @@ export function scheduleConnect(isoTime) {
   if (msUntil <= 0) {
     // Session is imminent or already started — connect now
     console.log('[F1Live] session imminent, connecting now')
+    archivedSessionKey   = null
+    sessionDataStartTime = null
     if (!connected && !reconnecting) connectWs().catch(e => console.error('[F1Live] connect error:', e.message))
     return
   }
@@ -319,7 +374,8 @@ export function scheduleConnect(isoTime) {
   console.log(`[F1Live] next session ${isoTime} — will connect at ${eta.toISOString()} (${Math.round(msUntil / 60000)}min)`)
   connectTimer = setTimeout(() => {
     connectTimer = null
-    archivedSessionKey = null  // allow fresh session
+    archivedSessionKey   = null  // allow fresh session
+    sessionDataStartTime = null  // reset session clock
     connectWs().catch(e => console.error('[F1Live] scheduled connect error:', e.message))
   }, msUntil)
 }
@@ -461,7 +517,15 @@ export function getF1LiveClassification() {
   const drivers = DriverList
 
   function driverEntry(num) {
-    const d = drivers[num] || {}
+    const d        = drivers[num] || {}
+    const stints   = state.TimingAppData?.Lines?.[num]?.Stints
+    const compound = stints?.length
+      ? ((stints[stints.length - 1].Compound || '').toUpperCase() || null)
+      : null
+    const channels = state.CarData?.[num]?.Channels || {}
+    const throttle = channels[4] != null ? Math.round(channels[4]) : null
+    const brake    = channels[5] != null ? Math.min(100, Math.round(channels[5])) : null
+    const gear     = channels[0] != null ? Math.round(channels[0]) : null  // 0=N, 1-8
     return {
       driverNum: num,
       acronym:   d.Tla        || num,
@@ -469,6 +533,10 @@ export function getF1LiveClassification() {
       lastName:  d.LastName   || d.Tla || num,
       teamName:  d.TeamName   || '',
       teamColor: d.TeamColour ? `#${d.TeamColour}` : null,
+      compound:  compound || null,
+      throttle,
+      brake,
+      gear,
     }
   }
 

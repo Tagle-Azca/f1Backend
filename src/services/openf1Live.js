@@ -93,53 +93,69 @@ const SESSION_MAX_DURATION = {
   'Race':            240 * 60 * 1000,  // 4h for safety cars / suspensions
 }
 
+// Cache for findLiveSession: { result, expiresAt }
+// Active session → refresh every 30s | No session → don't retry for 5 min
+let _liveSessionCache = null
+
 /**
  * Find ANY currently active F1 session (FP, Qualifying, Sprint, Race).
  * A session is "active" if it started and is within its estimated max duration.
  * Returns { sessionKey, sessionName, raceName, isRaceType } or null.
  */
 export async function findLiveSession() {
+  const now = Date.now()
+
+  // Return cached result if still fresh
+  if (_liveSessionCache && now < _liveSessionCache.expiresAt) {
+    return _liveSessionCache.result
+  }
+
   const year = new Date().getFullYear()
   try {
     const sessions = await of1Fetch(`/sessions?year=${year}`)
-    console.log(`[Live] OpenF1 /sessions?year=${year} →`, Array.isArray(sessions) ? `${sessions.length} sessions` : sessions)
+    if (!Array.isArray(sessions) || !sessions.length) {
+      _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
+      return null
+    }
 
-    if (!Array.isArray(sessions) || !sessions.length) return null
-
-    const now    = Date.now()
     const sorted = [...sessions].sort((a, b) => new Date(b.date_start) - new Date(a.date_start))
-
-    // Log the 3 most recent sessions for diagnosis
-    sorted.slice(0, 3).forEach(s => {
-      const diff = Math.round((now - new Date(s.date_start).getTime()) / 60000)
-      console.log(`[Live]   ${s.session_name} (key=${s.session_key}) started ${diff}min ago — max=${Math.round((SESSION_MAX_DURATION[s.session_name] || 90*60000)/60000)}min`)
-    })
 
     for (const s of sorted) {
       const start = new Date(s.date_start).getTime()
-      if (now < start) continue  // hasn't started
+      if (now < start) continue  // hasn't started yet
 
-      // Prefer date_end from OpenF1; fall back to estimated max duration
       const end = s.date_end
         ? new Date(s.date_end).getTime()
         : start + (SESSION_MAX_DURATION[s.session_name] || 90 * 60 * 1000)
 
-      console.log(`[Live]   ${s.session_name} key=${s.session_key} end=${s.date_end || 'estimated'} → ${now <= end ? 'LIVE' : 'ended'}`)
-
       if (now <= end) {
-        return {
+        const result = {
           sessionKey:  s.session_key,
           sessionName: s.session_name,
           raceName:    s.meeting_name || s.meeting_official_name || s.location || '',
           isRaceType:  s.session_name === 'Race' || s.session_name === 'Sprint',
         }
+        console.log(`[Live] findLiveSession: LIVE → ${s.session_name} key=${s.session_key}`)
+        _liveSessionCache = { result, expiresAt: now + 30_000 }  // recheck in 30s
+        return result
       }
     }
+
+    // No active session — don't hammer OpenF1 for 5 minutes
+    console.log('[Live] findLiveSession: no active session, caching for 5min')
+    _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
     return null
   } catch (err) {
     console.error('[Live] findLiveSession error:', err.message)
+    // On error, cache for 1 minute to avoid hammering a failing endpoint
+    _liveSessionCache = { result: null, expiresAt: now + 60_000 }
     return null
   }
+}
+
+/** Force-clear the live session cache (e.g. when F1Live connects/disconnects) */
+export function clearLiveSessionCache() {
+  _liveSessionCache = null
 }
 
 // ── Live timing (dashboard) ───────────────────────────────────

@@ -1,6 +1,16 @@
-import Race    from '../models/Race.js'
-import Circuit from '../models/Circuit.js'
+import Race            from '../models/Race.js'
+import Circuit         from '../models/Circuit.js'
+import SessionSnapshot from '../models/SessionSnapshot.js'
 import { F1_HEADERS as HEADERS } from '../utils/http.js'
+
+const SESSION_NAME_MAP = {
+  fp1:    'Practice 1',
+  fp2:    'Practice 2',
+  fp3:    'Practice 3',
+  quali:  'Qualifying',
+  sprint: 'Sprint',
+  sq:     'Sprint Shootout',
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -186,6 +196,30 @@ export async function listRaces(req, res, next) {
       }
       return base
     }))
+  } catch (err) { next(err) }
+}
+
+export async function getSessionSnapshot(req, res, next) {
+  try {
+    const { season, round } = req.params
+    const { session }       = req.query
+    const sessionName       = SESSION_NAME_MAP[session]
+    if (!sessionName) return res.status(400).json({ message: 'Invalid session key' })
+
+    // Look up race name to match snapshot
+    const race = await Race.findOne({ season, round }, { raceName: 1 }).lean()
+    let raceName = race?.raceName
+
+    // Upcoming race not in DB yet — try Jolpica for the name
+    if (!raceName) {
+      const jr = await fetchJolpicaRace(season, round)
+      raceName  = jr?.raceName
+    }
+    if (!raceName) return res.json(null)
+
+    const snapshot = await SessionSnapshot.findOne({ raceName, sessionName })
+      .select('-__v -createdAt -updatedAt').lean()
+    res.json(snapshot || null)
   } catch (err) { next(err) }
 }
 

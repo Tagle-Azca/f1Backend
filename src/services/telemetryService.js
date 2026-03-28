@@ -2,6 +2,7 @@ import {
   sessionKeyFromRaceId,
   findLiveRaceSession,
   findLiveSession,
+  clearLiveSessionCache,
   getLiveDrivers,
   getLiveLapTimes,
   getLivePitStops,
@@ -14,6 +15,7 @@ import {
 import {
   getF1LiveClassification,
   isF1LiveConnected,
+  getLastSessionSnapshot,
 } from './f1LiveTiming.js'
 import * as repo from '../repositories/telemetryRepository.js'
 
@@ -251,6 +253,10 @@ export async function getTimingTower() {
           : (d.statLabel || 'LEADER'),
         inPit:      d.inPit     || false,
         retired:    d.retired   || false,
+        compound:   d.compound  || null,
+        throttle:   d.throttle  ?? null,
+        brake:      d.brake     ?? null,
+        gear:       d.gear      ?? null,
         s1: d.sectors?.[0]?.value ? { time: d.sectors[0].value, color: d.sectors[0].status } : null,
         s2: d.sectors?.[1]?.value ? { time: d.sectors[1].value, color: d.sectors[1].status } : null,
         s3: d.sectors?.[2]?.value ? { time: d.sectors[2].value, color: d.sectors[2].status } : null,
@@ -269,7 +275,37 @@ export async function getTimingTower() {
     }
   }
 
-  // Fallback: OpenF1 polling (available once F1 live feed connects ~15min before session)
+  // Fallback: last completed session snapshot (shown as "completed")
+  const snapshot = getLastSessionSnapshot()
+  if (snapshot?.classification?.length) {
+    const drivers = snapshot.classification.map(d => ({
+      position:   d.position,
+      driverNum:  d.driverNum,
+      acronym:    d.acronym,
+      teamName:   d.teamName,
+      teamColor:  d.teamColor,
+      compound:   d.compound   || null,
+      throttle:   null,
+      brake:      null,
+      bestLapStr: d.bestLap    || null,
+      gapStr:     d.statLabel === 'gap' ? (d.stat || 'LEADER') : (d.statLabel || 'LEADER'),
+      s1: d.sectors?.[0]?.value ? { time: d.sectors[0].value, color: d.sectors[0].status } : null,
+      s2: d.sectors?.[1]?.value ? { time: d.sectors[1].value, color: d.sectors[1].status } : null,
+      s3: d.sectors?.[2]?.value ? { time: d.sectors[2].value, color: d.sectors[2].status } : null,
+    }))
+    return {
+      source:      'snapshot',
+      sessionName: snapshot.sessionName,
+      raceName:    snapshot.raceName,
+      isRaceType:  snapshot.isRaceType,
+      completed:   true,
+      savedAt:     snapshot.savedAt,
+      updatedAt:   new Date().toISOString(),
+      drivers,
+    }
+  }
+
+  // Last fallback: OpenF1 polling (cached — null result held for 5min, active for 30s)
   const session = await findLiveSession()
   if (!session) return null
   const drivers = await getLiveTimingTower(session.sessionKey, session.isRaceType)

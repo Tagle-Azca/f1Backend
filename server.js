@@ -6,7 +6,8 @@ import { connectMongo }    from './src/config/mongodb.js'
 import { connectCassandra } from './src/config/cassandra.js'
 import { connectDgraph }   from './src/config/dgraph.js'
 import routes from './src/routes/index.js'
-import { startF1LiveTiming, scheduleConnect, isF1LiveConnected } from './src/services/f1LiveTiming.js'
+import { startF1LiveTiming, scheduleConnect, isF1LiveConnected, setOnSessionArchived, setOnFinalSnapshot } from './src/services/f1LiveTiming.js'
+import SessionSnapshot from './src/models/SessionSnapshot.js'
 import { scheduleAutoSeed } from './src/services/autoSeedService.js'
 import logger from './src/utils/logger.js'
 
@@ -18,12 +19,21 @@ app.use(cors({ origin: true }))  // allow all origins in dev
 app.use(express.json())
 
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,  // 15 minutes
-  max: 300,
+  windowMs: 15 * 60 * 1000,
+  max: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many requests, please try again later.' },
 })
+// Polling endpoints need a much higher limit — one client at 3s = 300 req/15min alone
+const pollingLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' },
+})
+app.use('/api/telemetry/timing-tower', pollingLimiter)
 app.use('/api/', apiLimiter)
 
 // ── Routes ───────────────────────────────────────────────
@@ -55,9 +65,31 @@ async function start() {
   app.listen(PORT, () => {
     logger.info(`Server running on http://localhost:${PORT}`)
     startF1LiveTiming()
+    // Persist final snapshot to MongoDB so it survives restarts
+    setOnFinalSnapshot(async (snapshot) => {
+      try {
+        await SessionSnapshot.findOneAndUpdate(
+          { raceName: snapshot.raceName, sessionName: snapshot.sessionName },
+          { $set: {
+            isRaceType:     snapshot.isRaceType     || false,
+            classification: snapshot.classification || [],
+            trackStatus:    snapshot.trackStatus    || null,
+            currentLap:     snapshot.currentLap     || null,
+            totalLaps:      snapshot.totalLaps      || null,
+            savedAt:        new Date(snapshot.savedAt),
+          }},
+          { upsert: true, new: true }
+        )
+        logger.info(`[F1Live] snapshot saved to DB: ${snapshot.sessionName} — ${snapshot.raceName}`)
+      } catch (e) {
+        logger.error('[F1Live] failed to persist snapshot: ' + e.message)
+      }
+    })
+    // When a session ends, immediately find and schedule the next one
+    setOnSessionArchived(refreshF1Schedule)
     refreshF1Schedule()
-    // Re-check schedule every 6 hours in case new races are added
-    setInterval(refreshF1Schedule, 6 * 60 * 60_000)
+    // Re-check schedule every hour in case of schedule changes
+    setInterval(refreshF1Schedule, 60 * 60_000)
   })
 }
 
