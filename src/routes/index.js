@@ -9,6 +9,7 @@ import graphRouter      from './graph.js'
 import searchRouter     from './search.js'
 import statsRouter      from './stats.js'
 import dashboardRouter  from './dashboard.js'
+import adminRouter      from './admin.js'
 
 const router = Router()
 
@@ -36,5 +37,8 @@ router.use('/telemetry', telemetryRouter)
 
 // Dgraph routes
 router.use('/graph',     graphRouter)
+
+// Admin routes
+router.use('/admin',     adminRouter)
 
 export default router
