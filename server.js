@@ -16,6 +16,7 @@ const app  = express()
 const PORT = process.env.PORT || 3001
 
 // ── Middleware ───────────────────────────────────────────
+app.set('trust proxy', 1)  // Render / reverse-proxy support
 app.use(cors({ origin: true }))  // allow all origins in dev
 app.use(express.json())
 
