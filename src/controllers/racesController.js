@@ -260,6 +260,40 @@ export async function getRace(req, res, next) {
     const jolpicaRace = await fetchJolpicaRace(season, round)
     race.schedule     = extractSchedule(jolpicaRace)
 
+    // Fill missing qualifying results: try MongoDB snapshot first, then Jolpica
+    if (!race.QualifyingResults?.length) {
+      // 1. MongoDB live-timing snapshot
+      const snap = await SessionSnapshot.findOne({
+        raceName:    race.raceName,
+        sessionName: 'Qualifying',
+      }).select('sessionName classification savedAt').lean()
+
+      if (snap?.classification?.length) {
+        race.qualifyingSnapshot = snap
+      } else {
+        // 2. Jolpica fallback (may be available before auto-seed runs)
+        try {
+          const qResp = await fetch(
+            `https://api.jolpi.ca/ergast/f1/${season}/${round}/qualifying.json`,
+            { headers: HEADERS, signal: AbortSignal.timeout(4000) }
+          )
+          if (qResp.ok) {
+            const qJson    = await qResp.json()
+            const qResults = qJson?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults || []
+            if (qResults.length) race.QualifyingResults = qResults
+          }
+        } catch { /* best-effort */ }
+      }
+    }
+
+    if (!race.SprintQualifyingResults?.length) {
+      const snap = await SessionSnapshot.findOne({
+        raceName:    race.raceName,
+        sessionName: 'Sprint Shootout',
+      }).select('sessionName classification savedAt').lean()
+      if (snap?.classification?.length) race.sprintQualifyingSnapshot = snap
+    }
+
     res.json(race)
   } catch (err) { next(err) }
 }

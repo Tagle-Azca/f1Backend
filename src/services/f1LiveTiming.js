@@ -17,7 +17,7 @@ import { clearLiveSessionCache } from './openf1Live.js'
 const BASE        = 'https://livetiming.formula1.com'
 const WS_BASE     = 'wss://livetiming.formula1.com'
 const HUB         = 'Streaming'
-const TOPICS      = ['SessionInfo', 'DriverList', 'TimingData', 'TimingAppData', 'CarData.z', 'LapCount', 'TrackStatus']
+const TOPICS      = ['SessionInfo', 'DriverList', 'TimingData', 'TimingAppData', 'CarData.z', 'Position.z', 'LapCount', 'TrackStatus']
 const RECONNECT_DELAY = 5_000   // ms before reconnect attempt
 const MAX_RECONNECTS  = 0       // 0 = unlimited
 
@@ -36,6 +36,7 @@ let state = {
   TimingData:    null,
   TimingAppData: null,  // current compound per driver
   CarData:       null,  // latest throttle/brake/speed per driver (decoded from CarData.z)
+  Position:      null,  // latest X/Y position per driver (decoded from Position.z)
   LapCount:      null,
   TrackStatus:   null,
 }
@@ -193,6 +194,22 @@ function handleMessage(raw) {
       if (topic === 'TimingData' || topic === 'TimingAppData') {
         state[topic] = deepMerge(state[topic] || {}, data)
         populated.push(topic)
+      } else if (topic === 'CarData.z') {
+        const decoded = decompressZ(data)
+        const entries = decoded?.Entries || []
+        if (entries.length) {
+          const latest = entries[entries.length - 1].Cars || {}
+          state.CarData = deepMerge(state.CarData || {}, latest)
+          populated.push(topic)
+        }
+      } else if (topic === 'Position.z') {
+        const decoded = decompressZ(data)
+        const entries = decoded?.Entries || []
+        if (entries.length) {
+          const latest = entries[entries.length - 1].Cars || {}
+          state.Position = { ...(state.Position || {}), ...latest }
+          populated.push(topic)
+        }
       } else if (TOPICS.includes(topic)) {
         state[topic] = data
         populated.push(topic)
@@ -230,6 +247,14 @@ function handleMessage(raw) {
           // Keep only the latest reading per car (merge new channels into existing)
           const latest = entries[entries.length - 1].Cars || {}
           state.CarData = deepMerge(state.CarData || {}, latest)
+        }
+      } else if (topic === 'Position.z') {
+        const decoded = decompressZ(data)
+        const entries = decoded?.Entries || []
+        if (entries.length) {
+          const latest = entries[entries.length - 1].Cars || {}
+          if (!state.Position) console.log('[F1Live] first Position.z received, cars:', Object.keys(latest).length)
+          state.Position = { ...(state.Position || {}), ...latest }
         }
       } else if (topic === 'TimingData' || topic === 'TimingAppData' || topic === 'DriverList') {
         state[topic] = deepMerge(state[topic] || {}, data)
@@ -322,7 +347,7 @@ async function connectWs() {
     sessionDataStartTime = null
     clearLiveSessionCache()  // allow OpenF1 to recheck now that F1Live dropped
     try { saveSnapshot(true) } catch (e) { console.error('[F1Live] saveSnapshot error on close:', e.message) }
-    state     = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, LapCount: null, TrackStatus: null }
+    state     = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, Position: null, LapCount: null, TrackStatus: null }
     console.log(`[F1Live] disconnected (${code})`, reason?.toString() || '')
     scheduleReconnect()
   })
@@ -479,6 +504,11 @@ export function getF1LiveTop3() {
 
 export function isF1LiveConnected() {
   return connected
+}
+
+/** True if the current session was intentionally archived (auto-expire or session end) */
+export function isSessionArchived() {
+  return !!archivedSessionKey
 }
 
 // Track status code → human label
@@ -639,4 +669,19 @@ export function saveSessionSnapshot() { saveSnapshot() }
 
 export function getLastSessionSnapshot() {
   return lastSessionSnapshot
+}
+
+/**
+ * Returns current car positions from Position.z, or null if unavailable.
+ * Shape: { positions: { "1": { x, y }, ... } }
+ */
+export function getF1LivePositions() {
+  if (!state.Position) return null
+  const positions = {}
+  for (const [num, pos] of Object.entries(state.Position)) {
+    if (pos.X != null && pos.Y != null) {
+      positions[num] = { x: pos.X, y: pos.Y }
+    }
+  }
+  return Object.keys(positions).length ? { positions } : null
 }

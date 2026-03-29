@@ -91,7 +91,7 @@ export async function fetchLastSession(nextRaceData, lastRaceData) {
             return {
               sessionType: 'Qualifying', sessionLabel: 'Qualifying',
               season, round, raceName, circuit, circuitId, locality, country, date,
-              top3: results.slice(0, 3).map(r => ({
+              top3: results.slice(0, 5).map(r => ({
                 position:      parseInt(r.position),
                 driverId:      r.Driver?.driverId || '',
                 name:          buildDriverName(r.Driver),
@@ -149,7 +149,7 @@ export async function fetchLastSession(nextRaceData, lastRaceData) {
             return {
               sessionType: 'Sprint Qualifying', sessionLabel: 'Sprint Quali',
               season, round, raceName, circuit, circuitId, locality, country, date,
-              top3: results.slice(0, 3).map(r => ({
+              top3: results.slice(0, 5).map(r => ({
                 position:      parseInt(r.position),
                 driverId:      r.Driver?.driverId || '',
                 name:          buildDriverName(r.Driver),

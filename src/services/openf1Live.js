@@ -10,7 +10,12 @@
  */
 
 const OPENF1  = 'https://api.openf1.org/v1'
-const HEADERS = { 'User-Agent': 'F1IntelligencePlatform/1.0' }
+// Browser-like headers — prevents 401/403 blocks from OpenF1's UA filter
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept':     '*/*',
+  'Referer':    'https://www.formula1.com/',
+}
 const TIMEOUT = 10000
 
 // In-memory cache per session_key to avoid redundant OpenF1 round-trips
@@ -52,31 +57,28 @@ export function sessionKeyFromRaceId(raceId) {
  * Returns { raceId, raceName, sessionKey, year } or null.
  */
 export async function findLiveRaceSession() {
-  const year = new Date().getFullYear()
   try {
-    const sessions = await of1Fetch(`/sessions?session_name=Race&year=${year}`)
-    if (!Array.isArray(sessions) || !sessions.length) return null
+    // Probe location data — no /sessions auth required.
+    // If there's data from the last 30 minutes, assume a live race weekend.
+    const since = new Date(Date.now() - 30 * 60_000).toISOString()
+    const data  = await of1Fetch(`/location?session_key=latest&date_gt=${since}&driver_number=1`)
+    if (!Array.isArray(data) || !data.length) return null
 
-    const now         = Date.now()
-    const PAST_WINDOW = 7 * 24 * 60 * 60 * 1000   // 7 days — covers unseeded race + Monday seeding
+    const entry = data[0]
+    const sessionKey = entry.session_key
+    const year       = new Date().getFullYear()
 
-    // Sort newest first
-    const sorted = [...sessions].sort((a, b) => new Date(b.date_start) - new Date(a.date_start))
+    // Use F1 Live state for race name if available
+    const f1live  = _getF1LiveState?.()
+    const raceName = f1live?.raceName || `Race ${sessionKey}`
 
-    for (const s of sorted) {
-      const diff = now - new Date(s.date_start).getTime()  // positive = past (race started)
-      // Only proxy races that have already started (diff > 0) and aren't seeded yet (diff < 7 days)
-      if (diff >= 0 && diff <= PAST_WINDOW) {
-        return {
-          raceId:     `${s.year}_${s.session_key}`,
-          raceName:   s.meeting_name || s.meeting_official_name || s.location || `Race ${s.session_key}`,
-          sessionKey: s.session_key,
-          year:       String(s.year),
-          isLive:     true,
-        }
-      }
+    return {
+      raceId:     `${year}_${sessionKey}`,
+      raceName,
+      sessionKey,
+      year:       String(year),
+      isLive:     true,
     }
-    return null
   } catch {
     return null
   }
@@ -102,6 +104,13 @@ let _liveSessionCache = null
  * A session is "active" if it started and is within its estimated max duration.
  * Returns { sessionKey, sessionName, raceName, isRaceType } or null.
  */
+/**
+ * Injected by server.js at startup so we can read F1 Live state without
+ * creating a circular import (f1LiveTiming.js already imports from us).
+ */
+let _getF1LiveState = null
+export function setF1LiveStateGetter(fn) { _getF1LiveState = fn }
+
 export async function findLiveSession() {
   const now = Date.now()
 
@@ -110,44 +119,32 @@ export async function findLiveSession() {
     return _liveSessionCache.result
   }
 
-  const year = new Date().getFullYear()
   try {
-    const sessions = await of1Fetch(`/sessions?year=${year}`)
-    if (!Array.isArray(sessions) || !sessions.length) {
+    // Probe /location with session_key=latest — no auth needed, no /sessions call.
+    // A non-empty result means a session is currently active.
+    const since = new Date(now - 3 * 60_000).toISOString()
+    const data  = await of1Fetch(`/location?session_key=latest&date_gt=${since}&driver_number=1`)
+
+    if (!Array.isArray(data) || !data.length) {
       _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
       return null
     }
 
-    const sorted = [...sessions].sort((a, b) => new Date(b.date_start) - new Date(a.date_start))
+    const sessionKey = data[0].session_key
 
-    for (const s of sorted) {
-      const start = new Date(s.date_start).getTime()
-      if (now < start) continue  // hasn't started yet
+    // Fill session_name / raceName / isRaceType from the F1 Live state when available
+    // (avoids any additional OpenF1 call that might require auth)
+    const f1live     = _getF1LiveState?.()
+    const sessionName = f1live?.sessionName || 'Race'
+    const raceName    = f1live?.raceName    || ''
+    const isRaceType  = f1live?.isRaceType  ?? (sessionName === 'Race' || sessionName === 'Sprint')
 
-      const end = s.date_end
-        ? new Date(s.date_end).getTime()
-        : start + (SESSION_MAX_DURATION[s.session_name] || 90 * 60 * 1000)
-
-      if (now <= end) {
-        const result = {
-          sessionKey:  s.session_key,
-          sessionName: s.session_name,
-          raceName:    s.meeting_name || s.meeting_official_name || s.location || '',
-          isRaceType:  s.session_name === 'Race' || s.session_name === 'Sprint',
-        }
-        console.log(`[Live] findLiveSession: LIVE → ${s.session_name} key=${s.session_key}`)
-        _liveSessionCache = { result, expiresAt: now + 30_000 }  // recheck in 30s
-        return result
-      }
-    }
-
-    // No active session — don't hammer OpenF1 for 5 minutes
-    console.log('[Live] findLiveSession: no active session, caching for 5min')
-    _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
-    return null
+    const result = { sessionKey, sessionName, raceName, isRaceType }
+    console.log(`[Live] findLiveSession: LIVE → ${sessionName} key=${sessionKey}`)
+    _liveSessionCache = { result, expiresAt: now + 30_000 }
+    return result
   } catch (err) {
     console.error('[Live] findLiveSession error:', err.message)
-    // On error, cache for 1 minute to avoid hammering a failing endpoint
     _liveSessionCache = { result: null, expiresAt: now + 60_000 }
     return null
   }
@@ -534,6 +531,54 @@ export async function getSafetyCarPeriods(sessionKey) {
   return periods
     .filter(p => p.lapEnd > p.lapStart)
     .sort((a, b) => a.lapStart - b.lapStart)
+}
+
+/**
+ * Fetches location + car_data in parallel using session_key=latest.
+ * Avoids the year-based /sessions query that now requires auth (401).
+ * Returns { positions: { driverNum: {x,y} }, telemetry: { driverNum: {rpm,gear,throttle,brake,drs,speed} } }
+ */
+export async function getLiveCarData() {
+  const since = new Date(Date.now() - 5_000).toISOString()
+
+  const [locResult, carResult] = await Promise.allSettled([
+    of1Fetch(`/location?session_key=latest&date_gt=${since}`),
+    of1Fetch(`/car_data?session_key=latest&date_gt=${since}`),
+  ])
+
+  // ── Positions ─────────────────────────────────────────────────
+  const positions = {}
+  if (locResult.status === 'fulfilled' && Array.isArray(locResult.value)) {
+    // Entries are chronological; last write per driver = most recent
+    for (const e of locResult.value) {
+      if (e.x != null && e.y != null) {
+        positions[String(e.driver_number)] = { x: e.x, y: e.y }
+      }
+    }
+  }
+
+  // ── Telemetry ─────────────────────────────────────────────────
+  const telemetry = {}
+  if (carResult.status === 'fulfilled' && Array.isArray(carResult.value)) {
+    const latest = new Map()
+    for (const e of carResult.value) {
+      const num = String(e.driver_number)
+      const cur = latest.get(num)
+      if (!cur || e.date > cur.date) latest.set(num, e)
+    }
+    for (const [num, e] of latest) {
+      telemetry[num] = {
+        rpm:      e.rpm      ?? null,
+        gear:     e.n_gear   ?? null,
+        throttle: e.throttle ?? null,
+        brake:    e.brake    ?? null,
+        drs:      e.drs      ?? null,
+        speed:    e.speed    ?? null,
+      }
+    }
+  }
+
+  return { positions, telemetry }
 }
 
 export async function getLivePositions(sessionKey) {

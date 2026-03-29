@@ -11,11 +11,15 @@ import {
   getSafetyCar,
   getRaceInfo,
   getTimingTower,
+  getCarPositions,
+  getCarData,
 } from '../controllers/telemetryController.js'
 
 const router = Router()
 
 router.get('/timing-tower',               getTimingTower)
+router.get('/car-positions',              getCarPositions)
+router.get('/car-data',                   getCarData)
 router.get('/races',                      getAvailableRaces)
 router.get('/drivers/:raceId',            getRaceDrivers)
 router.get('/laps/:raceId/:driverId',     getLapTimes)

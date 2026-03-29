@@ -1,5 +1,7 @@
 import { getCassandraClient } from '../config/cassandra.js'
 import * as telemetry from '../services/telemetryService.js'
+import { getF1LivePositions } from '../services/f1LiveTiming.js'
+import { getLiveCarData } from '../services/openf1Live.js'
 
 function cassandraUnavailable(res) {
   return res.status(503).json({ message: 'Cassandra not connected. Start Cassandra and seed data first.' })
@@ -60,6 +62,25 @@ export const getTireStrategy = requiresCassandra(async (req, res, next) => {
 
 export async function getTimingTower(req, res, next) {
   try { res.json(await telemetry.getTimingTower()) } catch (err) { next(err) }
+}
+
+export async function getCarPositions(req, res, next) {
+  try {
+    // F1 Live Timing Position.z is the primary source (no auth, lowest latency)
+    const f1live = getF1LivePositions()
+    if (f1live) return res.json(f1live)
+
+    // Fallback: OpenF1 /location with session_key=latest (no year-based auth needed)
+    const { positions } = await getLiveCarData()
+    res.json({ positions })
+  } catch (err) { next(err) }
+}
+
+export async function getCarData(req, res, next) {
+  try {
+    const data = await getLiveCarData()
+    res.json(data)
+  } catch (err) { next(err) }
 }
 
 export const getTeamPace = requiresCassandra(async (req, res, next) => {

@@ -6,7 +6,8 @@ import { connectMongo }    from './src/config/mongodb.js'
 import { connectCassandra } from './src/config/cassandra.js'
 import { connectDgraph }   from './src/config/dgraph.js'
 import routes from './src/routes/index.js'
-import { startF1LiveTiming, scheduleConnect, isF1LiveConnected, setOnSessionArchived, setOnFinalSnapshot } from './src/services/f1LiveTiming.js'
+import { startF1LiveTiming, scheduleConnect, isF1LiveConnected, isSessionArchived, setOnSessionArchived, setOnFinalSnapshot, getF1LiveClassification } from './src/services/f1LiveTiming.js'
+import { setF1LiveStateGetter } from './src/services/openf1Live.js'
 import SessionSnapshot from './src/models/SessionSnapshot.js'
 import { scheduleAutoSeed } from './src/services/autoSeedService.js'
 import logger from './src/utils/logger.js'
@@ -34,6 +35,8 @@ const pollingLimiter = rateLimit({
   message: { message: 'Too many requests, please try again later.' },
 })
 app.use('/api/telemetry/timing-tower', pollingLimiter)
+app.use('/api/telemetry/car-positions', pollingLimiter)
+app.use('/api/telemetry/car-data', pollingLimiter)
 app.use('/api/', apiLimiter)
 
 // ── Routes ───────────────────────────────────────────────
@@ -65,6 +68,7 @@ async function start() {
   app.listen(PORT, () => {
     logger.info(`Server running on http://localhost:${PORT}`)
     startF1LiveTiming()
+    setF1LiveStateGetter(getF1LiveClassification)  // lets openf1Live read session state without circular import
     // Persist final snapshot to MongoDB so it survives restarts
     setOnFinalSnapshot(async (snapshot) => {
       try {
@@ -126,7 +130,7 @@ async function refreshF1Schedule() {
       return diff >= 0 && diff <= SESSION_MAX_MS
     })
 
-    if (currentlyLive && !isF1LiveConnected()) {
+    if (currentlyLive && !isF1LiveConnected() && !isSessionArchived()) {
       logger.info(`[F1Schedule] session in progress (started ${Math.round((now - currentlyLive) / 60000)}min ago) — connecting now`)
       scheduleConnect(new Date(now - 1).toISOString())  // triggers immediate connect
       scheduleAutoSeed(races)
