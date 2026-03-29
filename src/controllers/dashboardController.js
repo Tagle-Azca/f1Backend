@@ -15,7 +15,14 @@ let liveCache = null
 export async function getDashboard(req, res, next) {
   try {
     const currentYear = String(new Date().getFullYear())
-    const today       = new Date().toISOString().slice(0, 10) // "YYYY-MM-DD"
+    const today       = new Date().toISOString().slice(0, 10) // "YYYY-MM-DD" UTC
+
+    /** Normalize any date value (Date object or string) to "YYYY-MM-DD" */
+    const toDateStr = (v) => {
+      if (!v) return ''
+      if (v instanceof Date) return v.toISOString().slice(0, 10)
+      return String(v).slice(0, 10)
+    }
 
     const seasonRaces = await Race.find({ season: currentYear })
       .select('season round raceName date time Circuit Results SprintResults')
@@ -40,7 +47,7 @@ export async function getDashboard(req, res, next) {
     }
 
     // ── Last completed race ───────────────────────────────
-    const currentYearCompleted = seasonRaces.filter(r => r.date && r.date <= today && r.Results?.length)
+    const currentYearCompleted = seasonRaces.filter(r => toDateStr(r.date) && toDateStr(r.date) <= today && r.Results?.length)
     let completedRaces = currentYearCompleted
 
     // Fallback for lastRaceData only: if no current year races done, show last race from prev year
@@ -74,7 +81,7 @@ export async function getDashboard(req, res, next) {
     }
 
     const jolpicaLastCompleted = (calendarForGapCheck || [])
-      .filter(r => r.date && r.date <= today)
+      .filter(r => toDateStr(r.date) && toDateStr(r.date) <= today)
       .sort((a, b) => parseInt(b.round) - parseInt(a.round))[0]
 
     let lastRace = lastMongoRace
@@ -150,15 +157,35 @@ export async function getDashboard(req, res, next) {
     }
 
     // ── Next race ─────────────────────────────────────────
-    let upcomingRaces = seasonRaces.filter(r =>
-      r.date && r.date >= today && !(r.Results?.length)
-    )
+    const nowMs = Date.now()
+
+    /**
+     * A race is "upcoming" if it hasn't finished yet.
+     * Comparing just the date isn't enough — on race day the race may already be over.
+     * We consider a race finished when: raceStart + 4h < now (4h covers the longest race).
+     */
+    const isUpcoming = (dateVal, timeVal) => {
+      const dateStr = toDateStr(dateVal)
+      if (!dateStr) return false
+      if (dateStr > today) return true               // strictly future date → definitely upcoming
+      if (dateStr < today) return false              // past date → not upcoming
+      // Same day: check if the race window (start + 4h) has passed
+      const raceTime = (timeVal || '00:00:00').replace(/Z$/i, '')
+      const startMs  = new Date(`${dateStr}T${raceTime}Z`).getTime()
+      return (nowMs - startMs) < 4 * 60 * 60 * 1000 // still within 4-hour race window
+    }
+
+    let upcomingRaces = seasonRaces
+      .filter(r => isUpcoming(r.date, r.time) && !(r.Results?.length))
+      .sort((a, b) => toDateStr(a.date).localeCompare(toDateStr(b.date)))
 
     if (!upcomingRaces.length) {
-      const cal = jolpicaAllRaces || null
+      // Prefer jolpicaAllRaces; fall back to calendarForGapCheck (same fetch, different path)
+      const cal = jolpicaAllRaces || calendarForGapCheck || null
       if (cal?.length) {
         upcomingRaces = cal
-          .filter(r => r.date && r.date >= today)
+          .filter(r => isUpcoming(r.date, r.time))
+          .sort((a, b) => toDateStr(a.date).localeCompare(toDateStr(b.date)))
           .map(r => ({
             season: r.season, round: r.round, raceName: r.raceName,
             date: r.date, time: r.time || null,

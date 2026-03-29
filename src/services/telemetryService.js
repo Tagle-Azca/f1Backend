@@ -266,6 +266,7 @@ export async function getTimingTower() {
         sessionName: live.sessionName,
         raceName:    live.raceName,
         isRaceType:  live.isRaceType,
+        completed:   live.finished || false,
         trackStatus: live.trackStatus,
         currentLap:  live.currentLap,
         totalLaps:   live.totalLaps,

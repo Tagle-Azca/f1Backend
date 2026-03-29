@@ -221,6 +221,14 @@ function handleMessage(raw) {
         sessionDataStartTime = Date.now()
         console.log('[F1Live] session data clock started')
       }
+
+      // Auto-archive immediately if we reconnected to an already-finished race
+      // (LapCount present + CurrentLap >= TotalLaps). Prevents stale "live" state.
+      const lc = state.LapCount
+      if (lc?.TotalLaps > 0 && lc?.CurrentLap >= lc?.TotalLaps) {
+        console.log(`[F1Live] reconnected to finished race (lap ${lc.CurrentLap}/${lc.TotalLaps}) — archiving immediately`)
+        setTimeout(() => saveSnapshot(true), 500)  // slight delay to let all topics settle
+      }
     }
   }
 
