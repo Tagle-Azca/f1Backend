@@ -294,6 +294,31 @@ export async function getRace(req, res, next) {
       if (snap?.classification?.length) race.sprintQualifyingSnapshot = snap
     }
 
+    // Race results fallback: F1Live snapshot → Jolpica (when Jolpica hasn't published yet)
+    if (!race.Results?.length) {
+      const snap = await SessionSnapshot.findOne({
+        raceName:    race.raceName,
+        sessionName: 'Race',
+      }).select('sessionName classification totalLaps savedAt').lean()
+
+      if (snap?.classification?.length) {
+        race.raceSnapshot = snap
+      } else {
+        // Try Jolpica directly (may already have results before our seed runs)
+        try {
+          const rResp = await fetch(
+            `https://api.jolpi.ca/ergast/f1/${season}/${round}/results.json`,
+            { headers: HEADERS, signal: AbortSignal.timeout(4000) }
+          )
+          if (rResp.ok) {
+            const rJson    = await rResp.json()
+            const rResults = rJson?.MRData?.RaceTable?.Races?.[0]?.Results || []
+            if (rResults.length) race.Results = rResults
+          }
+        } catch { /* best-effort */ }
+      }
+    }
+
     res.json(race)
   } catch (err) { next(err) }
 }
