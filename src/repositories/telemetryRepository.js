@@ -6,7 +6,7 @@ export async function isLiveRace(raceId) {
     const rows = await cassandraQuery(
       'SELECT race_id FROM race_meta WHERE race_id = ?', [raceId])
     return rows.length === 0
-  } catch { return false }
+  } catch { return true }  // Cassandra unavailable → treat as live → use OpenF1 proxy
 }
 
 export async function queryAvailableRaces() {

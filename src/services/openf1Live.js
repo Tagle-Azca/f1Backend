@@ -21,11 +21,17 @@ const TIMEOUT = 10000
 // In-memory cache per session_key to avoid redundant OpenF1 round-trips
 const cache = new Map()
 
-async function of1Fetch(path) {
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+async function of1Fetch(path, retries = 3, backoff = 1200) {
   const resp = await fetch(`${OPENF1}${path}`, {
     headers: HEADERS,
     signal:  AbortSignal.timeout(TIMEOUT),
   })
+  if (resp.status === 429 && retries > 0) {
+    await sleep(backoff)
+    return of1Fetch(path, retries - 1, backoff * 2)
+  }
   if (!resp.ok) throw new Error(`OpenF1 ${resp.status} ${path}`)
   return resp.json()
 }
@@ -34,12 +40,28 @@ function cacheKey(sessionKey, resource) {
   return `${sessionKey}:${resource}`
 }
 
+// In-flight promise deduplication — prevents concurrent identical requests
+// both triggering separate OpenF1 calls and hitting rate limits
+const inFlight = new Map()
+
 async function cachedFetch(sessionKey, resource, path) {
   const k = cacheKey(sessionKey, resource)
   if (cache.has(k)) return cache.get(k)
-  const data = await of1Fetch(path)
-  cache.set(k, data)
-  return data
+
+  // If the same request is already in flight, wait for it instead of firing a new one
+  if (inFlight.has(k)) return inFlight.get(k)
+
+  const promise = of1Fetch(path).then(data => {
+    cache.set(k, data)
+    inFlight.delete(k)
+    return data
+  }).catch(err => {
+    inFlight.delete(k)
+    throw err
+  })
+
+  inFlight.set(k, promise)
+  return promise
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -376,7 +398,7 @@ export async function getLiveLapTimes(sessionKey, driverId) {
   const driverStints = allStints.filter(s => String(s.driver_number) === String(driverId))
 
   return laps
-    .filter(l => l.lap_duration != null)
+    .filter(l => l.lap_duration != null && l.lap_duration > 0 && parseFloat(l.lap_duration) <= 300)
     .map(l => {
       const stint = driverStints.find(s => l.lap_number >= s.lap_start && l.lap_number <= s.lap_end)
       return {
@@ -415,7 +437,7 @@ export async function getLiveRacePace(sessionKey, driverIds) {
     return {
       driverId,
       laps: laps
-        .filter(l => l.lap_duration != null)
+        .filter(l => l.lap_duration != null && l.lap_duration > 0 && parseFloat(l.lap_duration) <= 300)
         .map(l => ({
           lap:   l.lap_number,
           time:  parseFloat(l.lap_duration),
@@ -426,10 +448,9 @@ export async function getLiveRacePace(sessionKey, driverIds) {
 }
 
 export async function getLiveTireStrategy(sessionKey) {
-  const [stints, drivers] = await Promise.all([
-    cachedFetch(sessionKey, 'stints',  `/stints?session_key=${sessionKey}`),
-    cachedFetch(sessionKey, 'drivers', `/drivers?session_key=${sessionKey}`),
-  ])
+  // Sequential to avoid hitting OpenF1 rate limits with concurrent requests
+  const stints  = await cachedFetch(sessionKey, 'stints',  `/stints?session_key=${sessionKey}`)
+  const drivers = await cachedFetch(sessionKey, 'drivers', `/drivers?session_key=${sessionKey}`)
 
   const driverMap = new Map(drivers.map(d => [d.driver_number, d]))
   const byDriver  = new Map()
@@ -505,7 +526,11 @@ export async function getSafetyCarPeriods(sessionKey) {
     const text = `${flag} ${msg}`
 
     // ── VSC ──────────────────────────────────────────
-    if (cat === 'vsc' || (text.includes('VIRTUAL') && text.includes('SAFETY'))) {
+    // OpenF1 sometimes uses cat=SafetyCar with msg='VSC DEPLOYED' instead of cat=vsc
+    const isVSC = cat === 'vsc'
+      || msg.includes('VSC')
+      || (text.includes('VIRTUAL') && text.includes('SAFETY'))
+    if (isVSC) {
       if (text.includes('DEPLOY')) {
         if (openVSC) periods.push({ ...openVSC, lapEnd: lap })
         openVSC = { type: 'VSC', lapStart: lap }
@@ -514,7 +539,7 @@ export async function getSafetyCarPeriods(sessionKey) {
       }
     }
     // ── SC (not VSC) ─────────────────────────────────
-    else if (cat === 'safetycar' || (text.includes('SAFETY CAR') && !text.includes('VIRTUAL'))) {
+    else if (cat === 'safetycar' || (text.includes('SAFETY CAR') && !text.includes('VIRTUAL') && !msg.includes('VSC'))) {
       if (text.includes('DEPLOY')) {
         if (openSC) periods.push({ ...openSC, lapEnd: lap })
         openSC = { type: 'SC', lapStart: lap }
@@ -671,4 +696,34 @@ export async function getLivePositions(sessionKey) {
   })
 
   return { drivers: result, laps: positionsByLap, totalLaps: maxLap }
+}
+
+// ── OpenF1 race session catalogue (for production without Cassandra) ──────────
+
+let _of1RaceSessionsCache = null
+let _of1RaceSessionsAt    = 0
+const OF1_SESSIONS_TTL    = 60 * 60_000  // 1 hour
+
+/**
+ * Return all Race sessions from OpenF1 for the current and previous year.
+ * Cached for 1 hour so it doesn't hammer the API on every page load.
+ */
+export async function getOpenF1RaceSessions() {
+  const now = Date.now()
+  if (_of1RaceSessionsCache && now - _of1RaceSessionsAt < OF1_SESSIONS_TTL)
+    return _of1RaceSessionsCache
+
+  const thisYear = new Date().getFullYear()
+  const all = []
+  await Promise.allSettled(
+    [thisYear, thisYear - 1].map(async y => {
+      try {
+        const sessions = await of1Fetch(`/sessions?session_type=Race&year=${y}`)
+        if (Array.isArray(sessions)) all.push(...sessions)
+      } catch {}
+    })
+  )
+  _of1RaceSessionsCache = all
+  _of1RaceSessionsAt    = now
+  return all
 }

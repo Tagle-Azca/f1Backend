@@ -354,7 +354,6 @@ export async function getDashboard(req, res, next) {
 
     const standings = [...driverPoints.values()]
       .sort((a, b) => b.points - a.points)
-      .slice(0, 5)
       .map((d, i) => ({ ...d, position: i + 1, points: roundPoints(d.points) }))
 
     if (standings[0]) {
@@ -410,7 +409,6 @@ export async function getDashboard(req, res, next) {
 
     const constructorStandings = [...ctorPoints.values()]
       .sort((a, b) => b.points - a.points)
-      .slice(0, 5)
       .map((c, i) => ({ ...c, position: i + 1, points: roundPoints(c.points) }))
 
     // ── Most recent session ────────────────────────────────

@@ -20,6 +20,7 @@ const userSchema = new mongoose.Schema({
   providerId:   { type: String, default: null },
   displayName:  { type: String, default: '' },
   avatar:       { type: String, default: null },
+  dateOfBirth:  { type: Date,   default: null },
   preferences:  { type: preferencesSchema, default: () => ({}) },
   // Active refresh tokens (array so multiple devices are supported)
   refreshTokens: [{ type: String }],

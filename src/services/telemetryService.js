@@ -11,6 +11,7 @@ import {
   getLivePositions,
   getLiveTimingTower,
   getSafetyCarPeriods,
+  getOpenF1RaceSessions,
 } from './openf1Live.js'
 import {
   getF1LiveClassification,
@@ -22,13 +23,30 @@ import * as repo from '../repositories/telemetryRepository.js'
 // ── Available races ────────────────────────────────────────────────────────────
 
 export async function getAvailableRaces() {
-  const rows   = await repo.queryAvailableRaces()
+  // Cassandra races (empty array if Cassandra is down)
+  const rows   = await repo.queryAvailableRaces().catch(() => [])
   const seeded = rows.map(r => ({ raceId: r.race_id, raceName: r.race_name }))
+  const ids    = new Set(seeded.map(r => r.raceId))
+
+  // OpenF1 race catalogue — fills gaps when Cassandra is empty or unavailable
+  try {
+    const of1Sessions = await getOpenF1RaceSessions()
+    for (const s of of1Sessions) {
+      const raceId = `${s.year}_${s.session_key}`
+      if (!ids.has(raceId)) {
+        seeded.push({ raceId, raceName: s.meeting_name || raceId })
+        ids.add(raceId)
+      }
+    }
+  } catch { /* best-effort */ }
+
+  // Live race currently happening
   try {
     const live = await findLiveRaceSession()
-    if (live && !seeded.some(r => r.raceId === live.raceId))
+    if (live && !ids.has(live.raceId))
       seeded.push({ raceId: live.raceId, raceName: live.raceName, isLive: true })
   } catch { /* best-effort */ }
+
   return seeded
 }
 
@@ -53,6 +71,10 @@ export async function getRaceDrivers(raceId) {
 
 // ── Lap times ─────────────────────────────────────────────────────────────────
 
+// In-laps / out-laps / VSC-pit laps can record wall-clock time (the timer keeps
+// running while the car sits in the pit lane).  Anything above ~5 min is noise.
+const MAX_LAP_SECONDS = 300
+
 export async function getLapTimes(raceId, driverId) {
   if (await repo.isLiveRace(raceId)) {
     const key = validSessionKey(raceId)
@@ -62,10 +84,12 @@ export async function getLapTimes(raceId, driverId) {
     repo.queryLapTimes(raceId, driverId),
     repo.queryStints(raceId, driverId),
   ])
-  return laps.map(r => {
-    const stint = stints.find(s => r.lap_number >= s.lap_start && r.lap_number <= s.lap_end)
-    return { ...r, compound: stint?.compound?.toUpperCase() || null }
-  })
+  return laps
+    .filter(r => r.lap_time > 0 && r.lap_time <= MAX_LAP_SECONDS)
+    .map(r => {
+      const stint = stints.find(s => r.lap_number >= s.lap_start && r.lap_number <= s.lap_end)
+      return { ...r, compound: stint?.compound?.toUpperCase() || null }
+    })
 }
 
 // ── Race pace ─────────────────────────────────────────────────────────────────
@@ -232,6 +256,107 @@ export async function getTireStrategy(raceId) {
       }
     })
     .sort((a, b) => a.acronym.localeCompare(b.acronym))
+}
+
+// ── Winner tire strategy ──────────────────────────────────────────────────────
+
+export async function getWinnerStrategy(raceId) {
+  if (await repo.isLiveRace(raceId)) {
+    const key = validSessionKey(raceId)
+    if (!key) return null
+    const [strategy, liveClass] = await Promise.all([
+      getLiveTireStrategy(key),
+      Promise.resolve(getF1LiveClassification()),
+    ])
+    if (!strategy.length) return null
+    const p1Num = liveClass?.classification?.find(d => d.position === 1)?.driverNum
+    const winner = p1Num
+      ? strategy.find(d => d.driverId === String(p1Num))
+      : strategy[0]
+    if (!winner) return null
+    return {
+      driverId:  winner.driverId,
+      acronym:   winner.acronym,
+      fullName:  winner.fullName,
+      teamName:  winner.teamName,
+      totalLaps: liveClass?.totalLaps || null,
+      stints: winner.stints.map(s => ({
+        stintNumber: s.stintNumber,
+        compound:    (s.compound || 'UNKNOWN').toUpperCase(),
+        lapStart:    s.lapStart,
+        lapEnd:      s.lapEnd,
+        laps:        s.lapEnd != null && s.lapStart != null ? s.lapEnd - s.lapStart + 1 : null,
+        tyreAge:     s.tyreAge,
+      })),
+    }
+  }
+
+  const [stints, drivers, posRows] = await Promise.all([
+    repo.queryAllStints(raceId),
+    repo.queryRaceDrivers(raceId),
+    repo.queryRacePositions(raceId),
+  ])
+
+  if (!stints.length) return null
+
+  // totalLaps: max lap_end across all stints (most reliable for completed races)
+  const validEnds = stints.filter(s => s.lap_end != null).map(s => s.lap_end)
+  const totalLaps = validEnds.length ? Math.max(...validEnds) : null
+
+  // Find winner: scan backwards from the final lap looking for position=1
+  // Cassandra may return position as int or string — normalise to number
+  let winnerId = null
+  if (posRows.length) {
+    const maxLap = Math.max(...posRows.map(r => r.lap))
+    for (let lap = maxLap; lap >= maxLap - 5 && !winnerId; lap--) {
+      const p1 = posRows.find(r => r.lap === lap && Number(r.position) === 1)
+      if (p1) winnerId = p1.driver_id
+    }
+  }
+
+  // Fallback 1: driver whose last stint ends at totalLaps
+  if (!winnerId && totalLaps) {
+    const lastStint = stints
+      .filter(s => s.lap_end === totalLaps)
+      .sort((a, b) => b.stint_number - a.stint_number)[0]
+    if (lastStint) winnerId = lastStint.driver_id
+  }
+
+  // Fallback 2: driver with the globally highest lap_end (most laps completed)
+  if (!winnerId) {
+    const maxPerDriver = new Map()
+    for (const s of stints) {
+      if (s.lap_end == null) continue
+      if (!maxPerDriver.has(s.driver_id) || maxPerDriver.get(s.driver_id) < s.lap_end)
+        maxPerDriver.set(s.driver_id, s.lap_end)
+    }
+    if (maxPerDriver.size)
+      winnerId = [...maxPerDriver.entries()].sort((a, b) => b[1] - a[1])[0][0]
+  }
+
+  if (!winnerId) return null
+
+  const winnerStints = stints
+    .filter(s => s.driver_id === winnerId)
+    .map(s => ({
+      stintNumber: s.stint_number,
+      compound:    (s.compound || 'UNKNOWN').toUpperCase(),
+      lapStart:    s.lap_start,
+      lapEnd:      s.lap_end,
+      laps:        s.lap_end != null && s.lap_start != null ? s.lap_end - s.lap_start + 1 : null,
+      tyreAge:     s.tyre_age,
+    }))
+    .sort((a, b) => a.stintNumber - b.stintNumber)
+
+  const d = drivers.find(dr => dr.driver_id === winnerId)
+  return {
+    driverId:  winnerId,
+    acronym:   d?.acronym   || winnerId,
+    fullName:  d?.full_name || winnerId,
+    teamName:  d?.team_name || '',
+    totalLaps,
+    stints:    winnerStints,
+  }
 }
 
 // ── Live timing tower ─────────────────────────────────────────────────────────

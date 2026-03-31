@@ -18,7 +18,7 @@ function issueTokens(user) {
 // ── Register ───────────────────────────────────────────────────────────────
 
 export async function register(req, res) {
-  const { email, password, displayName } = req.body
+  const { email, password, displayName, dateOfBirth } = req.body
   if (!email || !password) {
     return res.status(400).json({ message: 'email and password are required' })
   }
@@ -27,7 +27,12 @@ export async function register(req, res) {
   if (existing) return res.status(409).json({ message: 'Email already in use' })
 
   const passwordHash = await bcrypt.hash(password, 12)
-  const user = await User.create({ email, passwordHash, displayName: displayName || '', provider: 'local' })
+  const user = await User.create({
+    email, passwordHash,
+    displayName: displayName || '',
+    dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : null,
+    provider: 'local',
+  })
 
   const { accessToken, refreshToken } = issueTokens(user)
   user.refreshTokens.push(refreshToken)
@@ -118,7 +123,7 @@ export async function refresh(req, res) {
   user.refreshTokens.push(newRefresh)
   await user.save()
 
-  res.json({ accessToken, refreshToken: newRefresh })
+  res.json({ accessToken, refreshToken: newRefresh, user: user.toSafeObject() })
 }
 
 // ── Logout ─────────────────────────────────────────────────────────────────

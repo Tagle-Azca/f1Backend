@@ -4,6 +4,7 @@ import { buildDriverName, roundPoints } from '../utils/formatters.js'
 import { cached } from '../utils/cache.js'
 import { F1_HEADERS } from '../utils/http.js'
 import { cassandraQuery, getCassandraClient } from '../config/cassandra.js'
+import { getOpenF1RaceSessions } from '../services/openf1Live.js'
 
 // Fetch race results from Jolpica to fill FastestLap/QualifyingResults gaps
 async function enrichFromJolpica(race) {
@@ -59,21 +60,41 @@ export async function getCircuitHistory(req, res, next) {
     // If lastRace is missing FastestLap or QualifyingResults, pull them live from Jolpica
     if (lastRace) await enrichFromJolpica(lastRace)
 
-    // Look up the real Cassandra race_id (format: year_sessionKey) for the last race
+    // Look up the Cassandra/OpenF1 race_id (format: year_sessionKey) for the last race
     let cassandraRaceId = null
-    if (lastRace && getCassandraClient()) {
-      try {
-        const rows = await cassandraQuery(
-          'SELECT race_id, race_name FROM race_meta WHERE year = ? ALLOW FILTERING',
-          [parseInt(lastRace.season)]
-        )
-        const needle = (lastRace.raceName || '').toLowerCase().replace(' grand prix', '').trim()
-        const match  = rows.find(r => {
-          const hay = (r.race_name || '').toLowerCase().replace(' grand prix', '').trim()
-          return hay === needle || hay.includes(needle) || needle.includes(hay)
-        })
-        if (match) cassandraRaceId = match.race_id
-      } catch {}
+    const norm = s => (s || '').toLowerCase().replace(' grand prix', '').trim()
+
+    if (lastRace) {
+      const needle = norm(lastRace.raceName)
+      const season = String(lastRace.season)
+
+      // 1️⃣  Cassandra race_meta (fastest, only available when Cassandra is running)
+      if (getCassandraClient()) {
+        try {
+          const rows = await cassandraQuery(
+            'SELECT race_id, race_name FROM race_meta WHERE year = ? ALLOW FILTERING',
+            [parseInt(lastRace.season)]
+          )
+          const match = rows.find(r => {
+            const hay = norm(r.race_name)
+            return hay === needle || hay.includes(needle) || needle.includes(hay)
+          })
+          if (match) cassandraRaceId = match.race_id
+        } catch {}
+      }
+
+      // 2️⃣  OpenF1 /sessions fallback — works even without Cassandra
+      if (!cassandraRaceId) {
+        try {
+          const sessions = await getOpenF1RaceSessions()
+          const match = sessions.find(s => {
+            const hay = norm(s.meeting_name)
+            return String(s.year) === season &&
+              (hay === needle || hay.includes(needle.slice(0, 5)) || needle.includes(hay.slice(0, 5)))
+          })
+          if (match) cassandraRaceId = `${match.year}_${match.session_key}`
+        } catch {}
+      }
     }
 
     res.json({ circuit, races, lastRace: lastRace || null, cassandraRaceId })
