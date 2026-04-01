@@ -18,6 +18,8 @@ const PORT = process.env.PORT || 3001
 // ── Middleware ───────────────────────────────────────────
 app.set('trust proxy', 1)  // Render / reverse-proxy support
 const ALLOWED_ORIGINS = [
+  'https://pitwall-intelligence.com',
+  'https://www.pitwall-intelligence.com',
   process.env.FRONTEND_URL,
   'http://localhost:5173',
   'http://localhost:4173',
