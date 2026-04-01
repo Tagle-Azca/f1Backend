@@ -17,7 +17,20 @@ const PORT = process.env.PORT || 3001
 
 // ── Middleware ───────────────────────────────────────────
 app.set('trust proxy', 1)  // Render / reverse-proxy support
-app.use(cors({ origin: true }))  // allow all origins in dev
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,
+  'http://localhost:5173',
+  'http://localhost:4173',
+].filter(Boolean)
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (curl, mobile apps, Render health checks)
+    if (!origin) return cb(null, true)
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
+    cb(new Error(`CORS: origin ${origin} not allowed`))
+  },
+  credentials: true,
+}))
 app.use(express.json())
 
 const apiLimiter = rateLimit({

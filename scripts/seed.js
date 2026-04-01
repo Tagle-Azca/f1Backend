@@ -304,10 +304,21 @@ async function seedCassandra() {
   `)
 
   // ── Data from OpenF1 ─────────────────────────────────
-  // OpenF1 has data from 2023 onwards. Use --year=YYYY or --year=2023,2024,2025 for multiple
+  // OpenF1 has data from 2023 onwards.
+  // --year=2023,2024,2025  explicit list
+  // --from=2023            same syntax as the Mongo section (generates 2023→currentYear)
+  // default                current year only
   const YEAR_ARG   = args.find(a => a.startsWith('--year='))
-  const YEAR_VAL   = YEAR_ARG ? YEAR_ARG.split('=')[1] : String(new Date().getFullYear())
-  const YEARS      = YEAR_VAL.split(',').map(y => y.trim()).filter(Boolean)
+  const thisYear   = new Date().getFullYear()
+  let YEARS
+  if (YEAR_ARG) {
+    YEARS = YEAR_ARG.split('=')[1].split(',').map(y => y.trim()).filter(Boolean)
+  } else if (FROM_YEAR) {
+    const from = Math.max(FROM_YEAR, 2023)               // OpenF1 starts at 2023
+    YEARS = Array.from({ length: thisYear - from + 1 }, (_, i) => String(from + i))
+  } else {
+    YEARS = [String(thisYear)]
+  }
 
   console.log(`[Cassandra] Fetching sessions from OpenF1 for year(s): ${YEARS.join(', ')}`)
 

@@ -28,17 +28,24 @@ export async function getAvailableRaces() {
   const seeded = rows.map(r => ({ raceId: r.race_id, raceName: r.race_name }))
   const ids    = new Set(seeded.map(r => r.raceId))
 
-  // OpenF1 race catalogue — fills gaps when Cassandra is empty or unavailable
+  // OpenF1 race catalogue — fills gaps + provides dates for all races
+  const dateMap = new Map()  // raceId → date_start ISO string
   try {
     const of1Sessions = await getOpenF1RaceSessions()
     for (const s of of1Sessions) {
       const raceId = `${s.year}_${s.session_key}`
+      if (s.date_start) dateMap.set(raceId, s.date_start)
       if (!ids.has(raceId)) {
         seeded.push({ raceId, raceName: s.meeting_name || raceId })
         ids.add(raceId)
       }
     }
   } catch { /* best-effort */ }
+
+  // Attach date to every entry (Cassandra-seeded ones included)
+  for (const r of seeded) {
+    if (dateMap.has(r.raceId)) r.date = dateMap.get(r.raceId)
+  }
 
   // Live race currently happening
   try {

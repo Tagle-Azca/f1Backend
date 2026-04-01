@@ -16,7 +16,7 @@ const HEADERS = {
   'Accept':     '*/*',
   'Referer':    'https://www.formula1.com/',
 }
-const TIMEOUT = 10000
+const TIMEOUT = 25000  // historical race datasets (positions, laps) can be large
 
 // In-memory cache per session_key to avoid redundant OpenF1 round-trips
 const cache = new Map()
@@ -705,8 +705,8 @@ let _of1RaceSessionsAt    = 0
 const OF1_SESSIONS_TTL    = 60 * 60_000  // 1 hour
 
 /**
- * Return all Race sessions from OpenF1 for the current and previous year.
- * Cached for 1 hour so it doesn't hammer the API on every page load.
+ * Return all Race sessions from OpenF1 for 2023 to the current year.
+ * OpenF1 coverage starts at 2023. Cached for 1 hour.
  */
 export async function getOpenF1RaceSessions() {
   const now = Date.now()
@@ -714,9 +714,10 @@ export async function getOpenF1RaceSessions() {
     return _of1RaceSessionsCache
 
   const thisYear = new Date().getFullYear()
+  const years    = Array.from({ length: thisYear - 2023 + 1 }, (_, i) => 2023 + i)
   const all = []
   await Promise.allSettled(
-    [thisYear, thisYear - 1].map(async y => {
+    years.map(async y => {
       try {
         const sessions = await of1Fetch(`/sessions?session_type=Race&year=${y}`)
         if (Array.isArray(sessions)) all.push(...sessions)
