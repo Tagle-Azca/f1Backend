@@ -429,6 +429,130 @@ export async function getDashboard(req, res, next) {
   } catch (err) { next(err) }
 }
 
+// ── Teammate H2H ───────────────────────────────────────────────────────────────
+
+export async function getTeammateH2H(req, res, next) {
+  try {
+    const { driver, season } = req.query
+    if (!driver || !season) return res.status(400).json({ message: 'driver and season are required' })
+
+    const driverLower = driver.toLowerCase().trim()
+
+    const races = await Race.find({ season })
+      .select('round raceName Results QualifyingResults SprintResults SprintQualifyingResults')
+      .sort({ round: 1 })
+      .lean()
+
+    let teammateName = null
+    let teammateDriverId = null
+    let myDriverId = null
+
+    // Find teammate by scanning results for same constructor
+    for (const race of races) {
+      const results = race.Results || []
+      const myResult = results.find(r => {
+        const full = `${r.Driver?.givenName ?? ''} ${r.Driver?.familyName ?? ''}`.trim()
+        return full.toLowerCase() === driverLower
+      })
+      if (!myResult) continue
+
+      myDriverId = myResult.Driver?.driverId ?? null
+
+      const myCtorId = myResult.Constructor?.constructorId
+      const mate = results.find(r => {
+        const full = `${r.Driver?.givenName ?? ''} ${r.Driver?.familyName ?? ''}`.trim()
+        return r.Constructor?.constructorId === myCtorId && full.toLowerCase() !== driverLower
+      })
+      if (mate) {
+        teammateName    = `${mate.Driver.givenName} ${mate.Driver.familyName}`
+        teammateDriverId = mate.Driver.driverId
+        break
+      }
+    }
+
+    // Look up driver photo
+    let driverPhotoUrl = null
+    if (myDriverId) {
+      const driverDoc = await Driver.findOne({ driverId: myDriverId }).select('photoUrl').lean()
+      driverPhotoUrl = driverDoc?.photoUrl ?? null
+    }
+
+    if (!teammateName) return res.json({ racesCompared: 0, qualiCompared: 0, race: null, quali: null, teammateName: null, driverPhotoUrl })
+
+    const teammateLower = teammateName.toLowerCase()
+
+    let raceDriver = 0, raceMate = 0, racesCompared = 0
+    let qualiDriver = 0, qualiMate = 0, qualiCompared = 0
+    let qualiGapSum = 0, qualiGapCount = 0
+
+    const isFinished = s => s === 'Finished' || /^\+\d+\s*Lap/.test(s || '')
+
+    // Parse "1:20.123" or "80.123" → seconds
+    const parseQTime = t => {
+      if (!t || t === '\\N' || t === 'N/A') return null
+      const m = t.match(/^(\d+):(\d+\.\d+)$/)
+      if (m) return parseInt(m[1]) * 60 + parseFloat(m[2])
+      const s = parseFloat(t)
+      return isNaN(s) ? null : s
+    }
+    const bestQualiTime = r => parseQTime(r.Q3) ?? parseQTime(r.Q2) ?? parseQTime(r.Q1) ?? null
+
+    for (const race of races) {
+      // ── Race H2H ──
+      const results   = race.Results || []
+      const myRace    = results.find(r => `${r.Driver?.givenName} ${r.Driver?.familyName}`.toLowerCase() === driverLower)
+      const mateRace  = results.find(r => `${r.Driver?.givenName} ${r.Driver?.familyName}`.toLowerCase() === teammateLower)
+
+      if (myRace && mateRace) {
+        const myPos   = parseInt(myRace.position)
+        const matePos = parseInt(mateRace.position)
+        if (!isNaN(myPos) && !isNaN(matePos)) {
+          racesCompared++
+          if (myPos < matePos) raceDriver++
+          else if (matePos < myPos) raceMate++
+        }
+      }
+
+      // ── Qualifying H2H + pace delta ──
+      const qResults  = race.QualifyingResults || []
+      const myQuali   = qResults.find(r => `${r.Driver?.givenName} ${r.Driver?.familyName}`.toLowerCase() === driverLower)
+      const mateQuali = qResults.find(r => `${r.Driver?.givenName} ${r.Driver?.familyName}`.toLowerCase() === teammateLower)
+
+      if (myQuali && mateQuali) {
+        const myQPos   = parseInt(myQuali.position)
+        const mateQPos = parseInt(mateQuali.position)
+        if (!isNaN(myQPos) && !isNaN(mateQPos)) {
+          qualiCompared++
+          if (myQPos < mateQPos) qualiDriver++
+          else if (mateQPos < myQPos) qualiMate++
+        }
+        const myT   = bestQualiTime(myQuali)
+        const mateT = bestQualiTime(mateQuali)
+        if (myT && mateT) {
+          qualiGapSum += myT - mateT
+          qualiGapCount++
+        }
+      }
+    }
+
+    const avgQualiGapSeconds = qualiGapCount > 0
+      ? Math.round((qualiGapSum / qualiGapCount) * 1000) / 1000
+      : null
+
+    res.json({
+      driverName:    driver,
+      teammateName,
+      driverPhotoUrl,
+      avgQualiGapSeconds,
+      season,
+      racesCompared,
+      qualiCompared,
+      race:  racesCompared  > 0 ? { driver: raceDriver,  teammate: raceMate  } : null,
+      quali: qualiCompared  > 0 ? { driver: qualiDriver, teammate: qualiMate } : null,
+    })
+  } catch (err) { next(err) }
+}
+
 export async function getLiveDashboard(req, res, next) {
   try {
     if (liveCache && Date.now() - liveCache.ts < 3000) {
