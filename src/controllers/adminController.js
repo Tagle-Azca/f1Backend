@@ -1,8 +1,10 @@
 import { getCassandraClient } from '../config/cassandra.js'
+import Race   from '../models/Race.js'
 import logger from '../utils/logger.js'
 
-const OPENF1  = 'https://api.openf1.org/v1'
-const HEADERS = { 'User-Agent': 'F1IntelligencePlatform/1.0', Accept: 'application/json' }
+const OPENF1   = 'https://api.openf1.org/v1'
+const JOLPICA  = 'https://api.jolpi.ca/ergast/f1'
+const HEADERS  = { 'User-Agent': 'F1IntelligencePlatform/1.0', Accept: 'application/json' }
 const sleep   = ms => new Promise(r => setTimeout(r, ms))
 
 async function fetchJSON(url) {
@@ -189,6 +191,121 @@ export async function triggerCassandraSeed(req, res) {
       logger.info('[AdminSeed] All done')
     } catch (err) {
       logger.error(`[AdminSeed] Failed: ${err.message}`)
+    }
+  })()
+}
+
+/**
+ * POST/GET /api/admin/sync-races?token=X&year=2025
+ *
+ * Pulls all race results for the given year from Jolpica and upserts
+ * them into MongoDB. Safe to run multiple times — only updates rounds
+ * that have results and are missing or outdated in the DB.
+ */
+export async function syncRaces(req, res) {
+  const token = req.query.token || req.headers['x-admin-token']
+  if (!process.env.ADMIN_SEED_TOKEN || token !== process.env.ADMIN_SEED_TOKEN) {
+    return res.status(401).json({ message: 'Unauthorized' })
+  }
+
+  const year = req.query.year || String(new Date().getFullYear())
+
+  res.json({ message: `Race sync started for year=${year}`, note: 'Check server logs for progress' })
+
+  ;(async () => {
+    try {
+      logger.info(`[SyncRaces] Fetching Jolpica results for ${year}…`)
+
+      // Fetch all results for the year (limit 500 covers every driver in every race)
+      const resp = await fetch(
+        `${JOLPICA}/${year}/results.json?limit=500`,
+        { headers: HEADERS, signal: AbortSignal.timeout(15_000) }
+      )
+      if (!resp.ok) throw new Error(`Jolpica HTTP ${resp.status}`)
+      const json  = await resp.json()
+      const races = json?.MRData?.RaceTable?.Races || []
+
+      if (!races.length) {
+        logger.warn('[SyncRaces] No races returned from Jolpica')
+        return
+      }
+
+      let updated = 0, skipped = 0
+
+      for (const jr of races) {
+        if (!jr.Results?.length) { skipped++; continue }
+
+        const filter = { season: jr.season, round: jr.round }
+        const update = {
+          $set: {
+            raceName:  jr.raceName,
+            date:      jr.date,
+            time:      jr.time || null,
+            url:       jr.url  || null,
+            Circuit: {
+              circuitId:   jr.Circuit?.circuitId,
+              circuitName: jr.Circuit?.circuitName,
+              Location:    jr.Circuit?.Location,
+            },
+            Results: jr.Results.map(r => ({
+              position:    r.position,
+              points:      r.points,
+              grid:        r.grid,
+              laps:        r.laps,
+              status:      r.status,
+              Driver: {
+                driverId:        r.Driver?.driverId,
+                givenName:       r.Driver?.givenName,
+                familyName:      r.Driver?.familyName,
+              },
+              Constructor: {
+                constructorId: r.Constructor?.constructorId,
+                name:          r.Constructor?.name,
+              },
+              Time:       r.Time       || null,
+              FastestLap: r.FastestLap || null,
+            })),
+          },
+        }
+
+        await Race.updateOne(filter, update, { upsert: true })
+        logger.info(`[SyncRaces] ✓ R${jr.round} ${jr.raceName}`)
+        updated++
+        await sleep(150) // be polite to Jolpica
+      }
+
+      // Also sync sprint results for sprint weekends
+      logger.info(`[SyncRaces] Fetching sprint results…`)
+      try {
+        const sresp = await fetch(
+          `${JOLPICA}/${year}/sprint.json?limit=200`,
+          { headers: HEADERS, signal: AbortSignal.timeout(10_000) }
+        )
+        if (sresp.ok) {
+          const sjson  = await sresp.json()
+          const sraces = sjson?.MRData?.RaceTable?.Races || []
+          for (const jr of sraces) {
+            if (!jr.SprintResults?.length) continue
+            await Race.updateOne(
+              { season: jr.season, round: jr.round },
+              { $set: { SprintResults: jr.SprintResults.map(r => ({
+                position: r.position, points: r.points, grid: r.grid, laps: r.laps, status: r.status,
+                Driver:      { driverId: r.Driver?.driverId, givenName: r.Driver?.givenName, familyName: r.Driver?.familyName },
+                Constructor: { constructorId: r.Constructor?.constructorId, name: r.Constructor?.name },
+              })) }},
+              { upsert: true }
+            )
+            logger.info(`[SyncRaces] ✓ Sprint R${jr.round} ${jr.raceName}`)
+            await sleep(150)
+          }
+        }
+      } catch (e) {
+        logger.warn(`[SyncRaces] Sprint fetch failed (non-critical): ${e.message}`)
+      }
+
+      logger.info(`[SyncRaces] Done — ${updated} races updated, ${skipped} skipped (no results yet)`)
+    } catch (err) {
+      logger.error(`[SyncRaces] Failed: ${err.message}`)
     }
   })()
 }
