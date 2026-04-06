@@ -146,6 +146,11 @@ export async function getDashboard(req, res, next) {
         circuitId: circuit?.circuitId   || '',
         locality:  circuit?.Location?.locality || '',
         country:   circuit?.Location?.country  || '',
+        Results:   results.map(r => ({
+          position: r.position,
+          Driver:   { givenName: r.Driver?.givenName, familyName: r.Driver?.familyName, driverId: r.Driver?.driverId },
+          status:   r.status,
+        })),
         podium,
         winner:    winner || null,
         fastestLap: fastestLap ? {
