@@ -324,6 +324,9 @@ async function connectWs() {
       // Periodically save a snapshot and enforce max session duration (every 30s)
       const snapshotInterval = setInterval(() => {
         try {
+          // Already archived — nothing left to do this session
+          if (archivedSessionKey) return
+
           if (!state.SessionInfo || !state.TimingData?.Lines) return
 
           // Auto-archive if session has been "live" longer than SESSION_MAX_LIVE_MS
