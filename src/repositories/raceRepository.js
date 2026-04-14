@@ -42,6 +42,14 @@ export function findBySeasonForCalendar(season) {
     .lean()
 }
 
+/** Races for a season with results and qualifying results (for H2H comparisons). */
+export function findSeasonRacesWithQuali(season) {
+  return Race.find({ season })
+    .select('round raceName Results QualifyingResults')
+    .sort({ round: 1 })
+    .lean()
+}
+
 /** Upsert race results for a given season + round. */
 export function upsertResults(season, round, data) {
   return Race.updateOne({ season, round }, { $set: data }, { upsert: true })
@@ -163,6 +171,50 @@ export function aggregateCircuitLastRaces() {
       lastSeason:   { $first: '$season' },
     } },
   ])
+}
+
+// ── Constructor stats ─────────────────────────────────────────────────────────
+
+export function findByConstructorIdWithStats(constructorId) {
+  return Race.find({ 'Results.Constructor.constructorId': constructorId })
+    .select('season round raceName Results QualifyingResults SprintResults')
+    .lean()
+}
+
+/** Championship standings per season — used to detect which constructor won each year */
+export function aggregateConstructorSeasonStandings(seasonYears) {
+  return Race.aggregate([
+    { $match: { season: { $in: seasonYears } } },
+    { $project: {
+      season:     1,
+      allResults: { $concatArrays: [
+        { $ifNull: ['$Results',       []] },
+        { $ifNull: ['$SprintResults', []] },
+      ]},
+    }},
+    { $unwind: '$allResults' },
+    { $group: {
+      _id: { season: '$season', ctor: '$allResults.Constructor.constructorId' },
+      pts: { $sum: { $toDouble: { $ifNull: ['$allResults.points', '0'] } } },
+    }},
+    { $sort: { '_id.season': 1, pts: -1 } },
+    { $group: { _id: '$_id.season', topCtor: { $first: '$_id.ctor' }, topPts: { $first: '$pts' } } },
+  ])
+}
+
+// ── Circuit history ───────────────────────────────────────────────────────────
+
+export function findByCircuitId(circuitId) {
+  return Race.find({ 'Circuit.circuitId': circuitId })
+    .select('season round raceName date Results QualifyingResults')
+    .sort({ season: -1 })
+    .lean()
+}
+
+export function findLastCompletedByCircuitId(circuitId) {
+  return Race.findOne({ 'Circuit.circuitId': circuitId, 'Results.0': { $exists: true } })
+    .sort({ season: -1 })
+    .lean()
 }
 
 /**

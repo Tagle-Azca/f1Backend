@@ -1,5 +1,5 @@
-import Race   from '../models/Race.js'
-import Driver from '../models/Driver.js'
+import * as raceRepository   from '../repositories/raceRepository.js'
+import * as driverRepository from '../repositories/driverRepository.js'
 
 const parseQTime = t => {
   if (!t || t === '\\N' || t === 'N/A') return null
@@ -22,8 +22,8 @@ async function findTeammate(races, driverLower) {
     const mate = results.find(r => r.Constructor?.constructorId === myCtorId && fullName(r) !== driverLower)
     if (mate) {
       return {
-        myDriverId:      myResult.Driver?.driverId ?? null,
-        teammateName:    `${mate.Driver.givenName} ${mate.Driver.familyName}`,
+        myDriverId:   myResult.Driver?.driverId ?? null,
+        teammateName: `${mate.Driver.givenName} ${mate.Driver.familyName}`,
       }
     }
   }
@@ -73,19 +73,12 @@ function computeH2H(races, driverLower, teammateLower) {
 
 export async function getTeammateH2H(driver, season) {
   const driverLower = driver.toLowerCase().trim()
-
-  const races = await Race.find({ season })
-    .select('round raceName Results QualifyingResults')
-    .sort({ round: 1 })
-    .lean()
+  const races       = await raceRepository.findSeasonRacesWithQuali(season)
 
   const { myDriverId, teammateName } = await findTeammate(races, driverLower)
 
-  let driverPhotoUrl = null
-  if (myDriverId) {
-    const doc = await Driver.findOne({ driverId: myDriverId }).select('photoUrl').lean()
-    driverPhotoUrl = doc?.photoUrl ?? null
-  }
+  const driverMeta   = myDriverId ? await driverRepository.findDriverMeta(myDriverId) : null
+  const driverPhotoUrl = driverMeta?.photoUrl ?? null
 
   if (!teammateName) return { racesCompared: 0, qualiCompared: 0, race: null, quali: null, teammateName: null, driverPhotoUrl }
 

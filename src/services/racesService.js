@@ -1,7 +1,7 @@
-import * as raceRepository    from '../repositories/raceRepository.js'
-import * as circuitRepository from '../repositories/circuitRepository.js'
-import SessionSnapshot        from '../models/SessionSnapshot.js'
-import { F1_HEADERS as HEADERS } from '../utils/http.js'
+import * as raceRepository            from '../repositories/raceRepository.js'
+import * as circuitRepository         from '../repositories/circuitRepository.js'
+import * as sessionSnapshotRepository from '../repositories/sessionSnapshotRepository.js'
+import * as jolpica                   from '../repositories/jolpicaRepository.js'
 
 const SESSION_NAME_MAP = {
   fp1:    'Practice 1',
@@ -14,35 +14,20 @@ const SESSION_NAME_MAP = {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/** Is raceDate within the upcoming race weekend window? (up to 4 days before race day) */
 function isCurrentWeekend(dateStr, today) {
   if (!dateStr) return false
   const diff = (new Date(dateStr) - new Date(today)) / 86400000
   return diff >= 0 && diff <= 4
 }
 
-async function fetchJolpicaCalendar(year) {
-  try {
-    const resp = await fetch(
-      `https://api.jolpi.ca/ergast/f1/${year}/races.json?limit=100`,
-      { headers: HEADERS, signal: AbortSignal.timeout(4000) }
-    )
-    if (!resp.ok) return null
-    const json = await resp.json()
-    return json?.MRData?.RaceTable?.Races || null
-  } catch { return null }
+async function safeCalendar(year) {
+  try { return await jolpica.fetchCalendar(year) }
+  catch { return null }
 }
 
-async function fetchJolpicaRace(season, round) {
-  try {
-    const resp = await fetch(
-      `https://api.jolpi.ca/ergast/f1/${season}/${round}.json`,
-      { headers: HEADERS, signal: AbortSignal.timeout(4000) }
-    )
-    if (!resp.ok) return null
-    const json = await resp.json()
-    return json?.MRData?.RaceTable?.Races?.[0] || null
-  } catch { return null }
+async function safeRaceSchedule(season, round) {
+  try { return await jolpica.fetchRaceSchedule(season, round) }
+  catch { return null }
 }
 
 function extractSchedule(jr) {
@@ -61,29 +46,20 @@ function extractSchedule(jr) {
 
 // ── Public service functions ──────────────────────────────────────────────────
 
-/**
- * Returns an enriched list of races for a season.
- * For the current year: fills missing rounds from Jolpica and overlays sprint flags.
- * Upcoming races include the last circuit winner from historical data.
- *
- * @param {string} season
- * @returns {object[]}
- */
 export async function listRaces(season) {
   const currentYear = String(new Date().getFullYear())
   const today       = new Date().toISOString().slice(0, 10)
 
   const mongoRaces = await raceRepository.aggregateCalendarList(season)
-
   let races = mongoRaces
 
   if (season === currentYear) {
-    const jolpica = await fetchJolpicaCalendar(currentYear)
-    if (jolpica?.length) {
-      const jolpicaMap = new Map(jolpica.map(jr => [jr.round, jr]))
+    const jolpicaRaces = await safeCalendar(currentYear)
+    if (jolpicaRaces?.length) {
+      const jolpicaMap = new Map(jolpicaRaces.map(jr => [jr.round, jr]))
       const mongoSet   = new Set(mongoRaces.map(r => r.round))
 
-      for (const jr of jolpica) {
+      for (const jr of jolpicaRaces) {
         if (!mongoSet.has(jr.round)) {
           races.push({
             season: jr.season, round: jr.round, raceName: jr.raceName,
@@ -105,18 +81,13 @@ export async function listRaces(season) {
         if (r.hasSprint || r.hasSprintQualifying) return r
         const jr = jolpicaMap.get(r.round)
         if (!jr) return r
-        return {
-          ...r,
-          hasSprint:           !!(jr.Sprint),
-          hasSprintQualifying: !!(jr.SprintShootout),
-        }
+        return { ...r, hasSprint: !!(jr.Sprint), hasSprintQualifying: !!(jr.SprintShootout) }
       })
 
       races.sort((a, b) => parseInt(a.round) - parseInt(b.round))
     }
   }
 
-  // Enrich upcoming races with last circuit winner from MongoDB history
   const upcomingIds = races
     .filter(r => !r.hasResults && r.Circuit?.circuitId)
     .map(r => r.Circuit.circuitId)
@@ -141,20 +112,11 @@ export async function listRaces(season) {
   })
 }
 
-/**
- * Returns full race details for a season + round.
- * Falls back to Jolpica if not in MongoDB yet.
- * Enriches with circuit track coords, weekend schedule, and qualifying/race snapshots.
- *
- * @param {string} season
- * @param {string} round
- * @returns {object|null}
- */
 export async function getRace(season, round) {
   let race = await raceRepository.findBySeasonRound(season, round)
 
   if (!race) {
-    const jr = await fetchJolpicaRace(season, round)
+    const jr = await safeRaceSchedule(season, round)
     if (!jr) return null
 
     race = {
@@ -180,62 +142,39 @@ export async function getRace(season, round) {
   const circuit = await circuitRepository.findById(race.Circuit?.circuitId)
   if (circuit?.trackCoords?.length) race.Circuit.trackCoords = circuit.trackCoords
 
-  // Fetch weekend schedule from Jolpica
-  const jolpicaRace = await fetchJolpicaRace(season, round)
-  race.schedule     = extractSchedule(jolpicaRace)
+  // Fetch weekend schedule
+  const jr   = await safeRaceSchedule(season, round)
+  race.schedule = extractSchedule(jr)
 
   // Fill missing qualifying results
   if (!race.QualifyingResults?.length) {
-    const snap = await SessionSnapshot.findOne({
-      raceName:    race.raceName,
-      sessionName: 'Qualifying',
-    }).select('sessionName classification savedAt').lean()
+    const snap = await sessionSnapshotRepository.findByRaceAndSession(race.raceName, 'Qualifying')
 
     if (snap?.classification?.length) {
       race.qualifyingSnapshot = snap
     } else {
       try {
-        const qResp = await fetch(
-          `https://api.jolpi.ca/ergast/f1/${season}/${round}/qualifying.json`,
-          { headers: HEADERS, signal: AbortSignal.timeout(4000) }
-        )
-        if (qResp.ok) {
-          const qJson    = await qResp.json()
-          const qResults = qJson?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults || []
-          if (qResults.length) race.QualifyingResults = qResults
-        }
+        const qResults = await jolpica.fetchQualifyingByRound(season, round)
+        if (qResults.length) race.QualifyingResults = qResults
       } catch { /* best-effort */ }
     }
   }
 
   if (!race.SprintQualifyingResults?.length) {
-    const snap = await SessionSnapshot.findOne({
-      raceName:    race.raceName,
-      sessionName: 'Sprint Shootout',
-    }).select('sessionName classification savedAt').lean()
+    const snap = await sessionSnapshotRepository.findByRaceAndSession(race.raceName, 'Sprint Shootout')
     if (snap?.classification?.length) race.sprintQualifyingSnapshot = snap
   }
 
   // Race results fallback: F1Live snapshot → Jolpica
   if (!race.Results?.length) {
-    const snap = await SessionSnapshot.findOne({
-      raceName:    race.raceName,
-      sessionName: 'Race',
-    }).select('sessionName classification totalLaps savedAt').lean()
+    const snap = await sessionSnapshotRepository.findByRaceAndSession(race.raceName, 'Race')
 
     if (snap?.classification?.length) {
       race.raceSnapshot = snap
     } else {
       try {
-        const rResp = await fetch(
-          `https://api.jolpi.ca/ergast/f1/${season}/${round}/results.json`,
-          { headers: HEADERS, signal: AbortSignal.timeout(4000) }
-        )
-        if (rResp.ok) {
-          const rJson    = await rResp.json()
-          const rResults = rJson?.MRData?.RaceTable?.Races?.[0]?.Results || []
-          if (rResults.length) race.Results = rResults
-        }
+        const raceData = await jolpica.fetchRoundResults(season, round)
+        if (raceData?.Results?.length) race.Results = raceData.Results
       } catch { /* best-effort */ }
     }
   }
@@ -243,15 +182,6 @@ export async function getRace(season, round) {
   return race
 }
 
-/**
- * Returns the F1Live session snapshot for a given session key.
- * Looks up the race name from MongoDB (or Jolpica if not yet imported).
- *
- * @param {string} season
- * @param {string} round
- * @param {string} session  — one of fp1, fp2, fp3, quali, sprint, sq
- * @returns {object|null}
- */
 export async function getSessionSnapshot(season, round, session) {
   const sessionName = SESSION_NAME_MAP[session]
   if (!sessionName) throw new Error(`Invalid session key: ${session}`)
@@ -260,12 +190,10 @@ export async function getSessionSnapshot(season, round, session) {
   let raceName = race?.raceName
 
   if (!raceName) {
-    const jr = await fetchJolpicaRace(season, round)
+    const jr = await safeRaceSchedule(season, round)
     raceName  = jr?.raceName
   }
   if (!raceName) return null
 
-  const snapshot = await SessionSnapshot.findOne({ raceName, sessionName })
-    .select('-__v -createdAt -updatedAt').lean()
-  return snapshot || null
+  return sessionSnapshotRepository.findByRaceAndSession(raceName, sessionName)
 }

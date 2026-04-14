@@ -1,4 +1,5 @@
 import { getF1LiveClassification, saveSessionSnapshot } from './f1LiveTiming.js'
+import logger from '../utils/logger.js'
 
 // 3-second cache so concurrent users don't all hit the live source
 let liveCache = null
@@ -8,7 +9,7 @@ export function getLiveDashboardData() {
 
   const live = getF1LiveClassification()
   if (live?.finished) saveSessionSnapshot()
-  if (live) console.log('[Live]', `${live.sessionName} — ${live.raceName}${live.finished ? ' (finished — archiving)' : ''}`)
+  if (live) logger.info(`[Live] ${live.sessionName} — ${live.raceName}${live.finished ? ' (finished — archiving)' : ''}`)
 
   if (!live) {
     const data = { isLive: false }

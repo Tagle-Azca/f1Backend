@@ -1,9 +1,10 @@
-import Race   from '../models/Race.js'
-import Driver from '../models/Driver.js'
+import * as raceRepository   from '../repositories/raceRepository.js'
+import * as driverRepository from '../repositories/driverRepository.js'
+import * as jolpica          from '../repositories/jolpicaRepository.js'
 import { getLastSessionSnapshot } from './f1LiveTiming.js'
-import { fetchLastSession } from './lastSessionService.js'
+import { fetchLastSession }       from './lastSessionService.js'
 import { buildDriverName, roundPoints } from '../utils/formatters.js'
-import { F1_HEADERS } from '../utils/http.js'
+import logger from '../utils/logger.js'
 
 const RACE_POINTS   = { 1:25, 2:18, 3:15, 4:12, 5:10, 6:8, 7:6, 8:4, 9:2, 10:1 }
 const SPRINT_POINTS = { 1:8, 2:7, 3:6, 4:5, 5:4, 6:3, 7:2, 8:1 }
@@ -20,15 +21,9 @@ const toDateStr = v => {
 
 // ── Calendar helpers ───────────────────────────────────────────────────────────
 
-async function fetchJolpicaCalendar(year) {
-  try {
-    const resp = await fetch(
-      `https://api.jolpi.ca/ergast/f1/${year}/races.json?limit=100`,
-      { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) }
-    )
-    if (resp.ok) return (await resp.json())?.MRData?.RaceTable?.Races || []
-  } catch (_) { /* non-critical */ }
-  return null
+async function safeCalendar(year) {
+  try { return await jolpica.fetchCalendar(year) }
+  catch { return null }
 }
 
 async function resolveLastRace(currentYear, seasonRaces, today) {
@@ -36,7 +31,7 @@ async function resolveLastRace(currentYear, seasonRaces, today) {
   let jolpicaAllRaces = null
 
   if (seasonRaces.length < 18) {
-    jolpicaAllRaces = await fetchJolpicaCalendar(currentYear)
+    jolpicaAllRaces = await safeCalendar(currentYear)
     if (jolpicaAllRaces?.length > calendarTotal) calendarTotal = jolpicaAllRaces.length
   }
 
@@ -44,28 +39,22 @@ async function resolveLastRace(currentYear, seasonRaces, today) {
   let completedRaces = currentYearCompleted
 
   if (!completedRaces.length) {
-    const prevRaces = await Race.find({ season: String(Number(currentYear) - 1) })
-      .select('season round raceName date time Circuit Results')
-      .sort({ round: 1 }).lean()
+    const prevRaces    = await raceRepository.findBySeasonForCalendar(String(Number(currentYear) - 1))
     completedRaces = prevRaces.filter(r => r.Results?.length)
   }
 
-  const calendarForGapCheck = jolpicaAllRaces ?? await fetchJolpicaCalendar(currentYear)
-  const jolpicaLastCompleted = (calendarForGapCheck || [])
+  const calendarForGapCheck    = jolpicaAllRaces ?? await safeCalendar(currentYear)
+  const jolpicaLastCompleted   = (calendarForGapCheck || [])
     .filter(r => toDateStr(r.date) <= today)
     .sort((a, b) => parseInt(b.round) - parseInt(a.round))[0]
 
-  const lastMongoRace = completedRaces[completedRaces.length - 1] || null
-  let lastRaceFromJolpica = null
+  const lastMongoRace      = completedRaces[completedRaces.length - 1] || null
+  let lastRaceFromJolpica  = null
 
   if (jolpicaLastCompleted && (!lastMongoRace || parseInt(jolpicaLastCompleted.round) > parseInt(lastMongoRace.round))) {
     try {
-      const resp = await fetch(
-        `https://api.jolpi.ca/ergast/f1/${currentYear}/${jolpicaLastCompleted.round}/results.json`,
-        { headers: F1_HEADERS, signal: AbortSignal.timeout(5000) }
-      )
-      if (resp.ok) lastRaceFromJolpica = (await resp.json())?.MRData?.RaceTable?.Races?.[0] || null
-    } catch (_) { /* fall back to MongoDB */ }
+      lastRaceFromJolpica = await jolpica.fetchRoundResults(currentYear, jolpicaLastCompleted.round)
+    } catch { /* fall back to MongoDB */ }
   }
 
   return {
@@ -130,20 +119,18 @@ function buildLastRaceData(lastRace, lastRaceFromJolpica) {
 
 async function fetchWeekendSchedule(season, round) {
   try {
-    const resp = await fetch(`https://api.jolpi.ca/ergast/f1/${season}/${round}.json`, { headers: F1_HEADERS, signal: AbortSignal.timeout(4000) })
-    if (!resp.ok) return null
-    const race = (await resp.json())?.MRData?.RaceTable?.Races?.[0]
-    if (!race) return null
+    const jr = await jolpica.fetchRaceSchedule(season, round)
+    if (!jr) return null
     const s = {}
-    if (race.FirstPractice)  s.fp1              = { date: race.FirstPractice.date,  time: race.FirstPractice.time }
-    if (race.SecondPractice) s.fp2              = { date: race.SecondPractice.date, time: race.SecondPractice.time }
-    if (race.ThirdPractice)  s.fp3              = { date: race.ThirdPractice.date,  time: race.ThirdPractice.time }
-    if (race.SprintShootout) s.sprintQualifying = { date: race.SprintShootout.date, time: race.SprintShootout.time }
-    if (race.Sprint)         s.sprint           = { date: race.Sprint.date,         time: race.Sprint.time }
-    if (race.Qualifying)     s.qualifying       = { date: race.Qualifying.date,     time: race.Qualifying.time }
-    s.race = { date: race.date, time: race.time }
+    if (jr.FirstPractice)  s.fp1              = { date: jr.FirstPractice.date,  time: jr.FirstPractice.time }
+    if (jr.SecondPractice) s.fp2              = { date: jr.SecondPractice.date, time: jr.SecondPractice.time }
+    if (jr.ThirdPractice)  s.fp3              = { date: jr.ThirdPractice.date,  time: jr.ThirdPractice.time }
+    if (jr.SprintShootout) s.sprintQualifying = { date: jr.SprintShootout.date, time: jr.SprintShootout.time }
+    if (jr.Sprint)         s.sprint           = { date: jr.Sprint.date,         time: jr.Sprint.time }
+    if (jr.Qualifying)     s.qualifying       = { date: jr.Qualifying.date,     time: jr.Qualifying.time }
+    s.race = { date: jr.date, time: jr.time }
     return s
-  } catch (_) { return null }
+  } catch { return null }
 }
 
 function resolveCurrentAndNextSession(schedule, raceDate) {
@@ -207,9 +194,9 @@ async function resolveNextRace(seasonRaces, jolpicaAllRaces, calendarForGapCheck
   const nextRace = upcomingRaces[0] || null
   if (!nextRace) return null
 
-  const raceTime  = (nextRace.time || '00:00:00').replace(/Z$/i, '')
-  const raceDate  = new Date(`${nextRace.date}T${raceTime}Z`)
-  const schedule  = await fetchWeekendSchedule(nextRace.season, nextRace.round)
+  const raceTime = (nextRace.time || '00:00:00').replace(/Z$/i, '')
+  const raceDate = new Date(`${nextRace.date}T${raceTime}Z`)
+  const schedule = await fetchWeekendSchedule(nextRace.season, nextRace.round)
   const { nextSession, currentSession } = resolveCurrentAndNextSession(schedule, raceDate)
 
   return {
@@ -236,7 +223,7 @@ function applySnapshotToDriverPoints(driverPoints, snap, completedRaces) {
   const POINTS_TBL = isSprint ? SPRINT_POINTS : RACE_POINTS
   if (isSnapshotAlreadyInMongo(completedRaces, snap, isSprint)) return
 
-  console.log(`[Dashboard] adding snapshot points for ${snap.sessionName} — ${snap.raceName}`)
+  logger.info(`[Dashboard] adding snapshot points for ${snap.sessionName} — ${snap.raceName}`)
   for (const driver of snap.classification) {
     const pts = POINTS_TBL[driver.position] || 0
     if (!pts) continue
@@ -314,9 +301,7 @@ export async function getDashboardData() {
   const currentYear = String(new Date().getFullYear())
   const today       = new Date().toISOString().slice(0, 10)
 
-  const seasonRaces = await Race.find({ season: currentYear })
-    .select('season round raceName date time Circuit Results SprintResults')
-    .sort({ round: 1 }).lean()
+  const seasonRaces = await raceRepository.findBySeasonForCalendar(currentYear)
 
   const { lastRace, lastRaceFromJolpica, calendarTotal, currentYearCompleted, completedRaces, jolpicaAllRaces, calendarForGapCheck } =
     await resolveLastRace(currentYear, seasonRaces, today)
@@ -328,10 +313,10 @@ export async function getDashboardData() {
   const { standings, constructorStandings } = computeStandings(completedRaces, snap)
 
   if (standings[0]) {
-    const leaderDoc = await Driver.findOne({ driverId: standings[0].driverId }).select('photoUrl permanentNumber code').lean()
-    if (leaderDoc) {
-      standings[0].photoUrl        = leaderDoc.photoUrl        || null
-      standings[0].permanentNumber = leaderDoc.permanentNumber || leaderDoc.code || null
+    const leaderMeta = await driverRepository.findDriverMeta(standings[0].driverId)
+    if (leaderMeta) {
+      standings[0].photoUrl        = leaderMeta.photoUrl        || null
+      standings[0].permanentNumber = leaderMeta.permanentNumber || leaderMeta.code || null
     }
   }
 

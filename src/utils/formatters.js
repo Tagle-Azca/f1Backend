@@ -19,3 +19,15 @@ export function roundPoints(value) {
 export function normalizeRaceName(name) {
   return (name || '').replace(' Grand Prix', ' GP')
 }
+
+/**
+ * Format a lap time in seconds to "M:SS.mmm" string.
+ * Returns null for falsy input.
+ * Example: 92.456 → "1:32.456"
+ */
+export function fmtLapTime(sec) {
+  if (!sec) return null
+  const m = Math.floor(sec / 60)
+  const s = (sec % 60).toFixed(3).padStart(6, '0')
+  return `${m}:${s}`
+}

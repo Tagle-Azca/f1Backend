@@ -26,7 +26,6 @@ const ALLOWED_ORIGINS = [
 ].filter(Boolean)
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (curl, mobile apps, Render health checks)
     if (!origin) return cb(null, true)
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
     cb(new Error(`CORS: origin ${origin} not allowed`))
@@ -42,7 +41,6 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: 'Too many requests, please try again later.' },
 })
-// Polling endpoints need a much higher limit — one client at 3s = 300 req/15min alone
 const pollingLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 3000,
@@ -84,8 +82,7 @@ async function start() {
   app.listen(PORT, () => {
     logger.info(`Server running on http://localhost:${PORT}`)
     startF1LiveTiming()
-    setF1LiveStateGetter(getF1LiveClassification)  // lets openf1Live read session state without circular import
-    // Persist final snapshot to MongoDB so it survives restarts
+    setF1LiveStateGetter(getF1LiveClassification) 
     setOnFinalSnapshot(async (snapshot) => {
       try {
         await SessionSnapshot.findOneAndUpdate(

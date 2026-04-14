@@ -3,16 +3,18 @@ import {
   findLiveRaceSession,
   findLiveSession,
   clearLiveSessionCache,
+  getLiveTimingTower,
+} from './openf1Live.js'
+import {
   getLiveDrivers,
   getLiveLapTimes,
   getLivePitStops,
   getLiveRacePace,
   getLiveTireStrategy,
   getLivePositions,
-  getLiveTimingTower,
   getSafetyCarPeriods,
-  getOpenF1RaceSessions,
-} from './openf1Live.js'
+} from './openf1Telemetry.js'
+import { getOpenF1RaceSessions } from '../repositories/openf1Repository.js'
 import {
   getF1LiveClassification,
   isF1LiveConnected,
@@ -267,6 +269,37 @@ export async function getTireStrategy(raceId) {
 
 // ── Winner tire strategy ──────────────────────────────────────────────────────
 
+function resolveHistoricalWinnerId(stints, posRows, totalLaps) {
+  // 1. Scan backwards from final lap for position=1 (Cassandra stores as int or string)
+  let winnerId = null
+  if (posRows.length) {
+    const maxLap = Math.max(...posRows.map(r => r.lap))
+    for (let lap = maxLap; lap >= maxLap - 5 && !winnerId; lap--) {
+      const p1 = posRows.find(r => r.lap === lap && Number(r.position) === 1)
+      if (p1) winnerId = p1.driver_id
+    }
+  }
+  // 2. Driver whose last stint ends exactly at totalLaps
+  if (!winnerId && totalLaps) {
+    const lastStint = stints
+      .filter(s => s.lap_end === totalLaps)
+      .sort((a, b) => b.stint_number - a.stint_number)[0]
+    if (lastStint) winnerId = lastStint.driver_id
+  }
+  // 3. Driver with highest lap_end (most laps completed)
+  if (!winnerId) {
+    const maxPerDriver = new Map()
+    for (const s of stints) {
+      if (s.lap_end == null) continue
+      if (!maxPerDriver.has(s.driver_id) || maxPerDriver.get(s.driver_id) < s.lap_end)
+        maxPerDriver.set(s.driver_id, s.lap_end)
+    }
+    if (maxPerDriver.size)
+      winnerId = [...maxPerDriver.entries()].sort((a, b) => b[1] - a[1])[0][0]
+  }
+  return winnerId
+}
+
 export async function getWinnerStrategy(raceId) {
   if (await repo.isLiveRace(raceId)) {
     const key = validSessionKey(raceId)
@@ -276,22 +309,17 @@ export async function getWinnerStrategy(raceId) {
       Promise.resolve(getF1LiveClassification()),
     ])
     if (!strategy.length) return null
-    const p1Num = liveClass?.classification?.find(d => d.position === 1)?.driverNum
-    const winner = p1Num
-      ? strategy.find(d => d.driverId === String(p1Num))
-      : strategy[0]
+    const p1Num  = liveClass?.classification?.find(d => d.position === 1)?.driverNum
+    const winner = p1Num ? strategy.find(d => d.driverId === String(p1Num)) : strategy[0]
     if (!winner) return null
     return {
-      driverId:  winner.driverId,
-      acronym:   winner.acronym,
-      fullName:  winner.fullName,
-      teamName:  winner.teamName,
+      driverId: winner.driverId, acronym: winner.acronym,
+      fullName: winner.fullName, teamName: winner.teamName,
       totalLaps: liveClass?.totalLaps || null,
       stints: winner.stints.map(s => ({
         stintNumber: s.stintNumber,
         compound:    (s.compound || 'UNKNOWN').toUpperCase(),
-        lapStart:    s.lapStart,
-        lapEnd:      s.lapEnd,
+        lapStart:    s.lapStart, lapEnd: s.lapEnd,
         laps:        s.lapEnd != null && s.lapStart != null ? s.lapEnd - s.lapStart + 1 : null,
         tyreAge:     s.tyreAge,
       })),
@@ -303,66 +331,28 @@ export async function getWinnerStrategy(raceId) {
     repo.queryRaceDrivers(raceId),
     repo.queryRacePositions(raceId),
   ])
-
   if (!stints.length) return null
 
-  // totalLaps: max lap_end across all stints (most reliable for completed races)
   const validEnds = stints.filter(s => s.lap_end != null).map(s => s.lap_end)
   const totalLaps = validEnds.length ? Math.max(...validEnds) : null
-
-  // Find winner: scan backwards from the final lap looking for position=1
-  // Cassandra may return position as int or string — normalise to number
-  let winnerId = null
-  if (posRows.length) {
-    const maxLap = Math.max(...posRows.map(r => r.lap))
-    for (let lap = maxLap; lap >= maxLap - 5 && !winnerId; lap--) {
-      const p1 = posRows.find(r => r.lap === lap && Number(r.position) === 1)
-      if (p1) winnerId = p1.driver_id
-    }
-  }
-
-  // Fallback 1: driver whose last stint ends at totalLaps
-  if (!winnerId && totalLaps) {
-    const lastStint = stints
-      .filter(s => s.lap_end === totalLaps)
-      .sort((a, b) => b.stint_number - a.stint_number)[0]
-    if (lastStint) winnerId = lastStint.driver_id
-  }
-
-  // Fallback 2: driver with the globally highest lap_end (most laps completed)
-  if (!winnerId) {
-    const maxPerDriver = new Map()
-    for (const s of stints) {
-      if (s.lap_end == null) continue
-      if (!maxPerDriver.has(s.driver_id) || maxPerDriver.get(s.driver_id) < s.lap_end)
-        maxPerDriver.set(s.driver_id, s.lap_end)
-    }
-    if (maxPerDriver.size)
-      winnerId = [...maxPerDriver.entries()].sort((a, b) => b[1] - a[1])[0][0]
-  }
-
+  const winnerId  = resolveHistoricalWinnerId(stints, posRows, totalLaps)
   if (!winnerId) return null
-
-  const winnerStints = stints
-    .filter(s => s.driver_id === winnerId)
-    .map(s => ({
-      stintNumber: s.stint_number,
-      compound:    (s.compound || 'UNKNOWN').toUpperCase(),
-      lapStart:    s.lap_start,
-      lapEnd:      s.lap_end,
-      laps:        s.lap_end != null && s.lap_start != null ? s.lap_end - s.lap_start + 1 : null,
-      tyreAge:     s.tyre_age,
-    }))
-    .sort((a, b) => a.stintNumber - b.stintNumber)
 
   const d = drivers.find(dr => dr.driver_id === winnerId)
   return {
-    driverId:  winnerId,
-    acronym:   d?.acronym   || winnerId,
-    fullName:  d?.full_name || winnerId,
-    teamName:  d?.team_name || '',
+    driverId: winnerId, acronym: d?.acronym || winnerId,
+    fullName: d?.full_name || winnerId, teamName: d?.team_name || '',
     totalLaps,
-    stints:    winnerStints,
+    stints: stints
+      .filter(s => s.driver_id === winnerId)
+      .map(s => ({
+        stintNumber: s.stint_number,
+        compound:    (s.compound || 'UNKNOWN').toUpperCase(),
+        lapStart:    s.lap_start, lapEnd: s.lap_end,
+        laps:        s.lap_end != null && s.lap_start != null ? s.lap_end - s.lap_start + 1 : null,
+        tyreAge:     s.tyre_age,
+      }))
+      .sort((a, b) => a.stintNumber - b.stintNumber),
   }
 }
 
@@ -456,10 +446,7 @@ export async function getTimingTower() {
 
 // ── Team pace ─────────────────────────────────────────────────────────────────
 
-export async function getTeamPace(teamName, year, requestedRaceId) {
-  const metaRows = await repo.queryRaceMetaByYear(year)
-  if (!metaRows.length) return null
-
+async function findTeamRaceAndDrivers(metaRows, teamName, requestedRaceId) {
   const sorted   = [...metaRows].sort((a, b) =>
     parseInt(b.race_id.split('_')[1] || 0) - parseInt(a.race_id.split('_')[1] || 0))
   const keywords = teamName.toLowerCase().split(' ').filter(w => w.length > 3)
@@ -477,11 +464,12 @@ export async function getTeamPace(teamName, year, requestedRaceId) {
       }
     }
   }
-  if (!teamDrivers.length) return null
+  return { teamDrivers, foundRaceId, foundRaceName, availableRaces }
+}
 
-  const allDriverRows = await repo.queryRaceDrivers(foundRaceId)
-  const fieldLapMap   = new Map()
-  const fieldS        = { s1: 0, s2: 0, s3: 0, n: 0 }
+async function computeFieldStats(foundRaceId, allDriverRows) {
+  const fieldLapMap = new Map()
+  const fieldS      = { s1: 0, s2: 0, s3: 0, n: 0 }
 
   await Promise.all(allDriverRows.map(async d => {
     const rows = await repo.queryLapTimes(foundRaceId, d.driver_id)
@@ -511,7 +499,11 @@ export async function getTeamPace(teamName, year, requestedRaceId) {
     ? Math.round(clean.reduce((a, b) => a + b, 0) / clean.length * 1000) / 1000
     : null
 
-  const driverPace = await Promise.all(teamDrivers.map(async d => {
+  return { fieldAvgPerLap, fieldAvgLap, fieldS }
+}
+
+async function computeTeamDriverPace(foundRaceId, teamDrivers) {
+  return Promise.all(teamDrivers.map(async d => {
     const [laps, stints] = await Promise.all([
       repo.queryLapTimes(foundRaceId, d.driver_id),
       repo.queryStints(foundRaceId, d.driver_id),
@@ -522,28 +514,44 @@ export async function getTeamPace(teamName, year, requestedRaceId) {
         .filter(l => l.lap_time > 0)
         .map(l => {
           const stint = stints.find(s => l.lap_number >= s.lap_start && l.lap_number <= s.lap_end)
-          return { lap: l.lap_number, time: Math.round(l.lap_time * 1000) / 1000,
-            s1: l.sector1, s2: l.sector2, s3: l.sector3, compound: stint?.compound || null }
+          return {
+            lap: l.lap_number, time: Math.round(l.lap_time * 1000) / 1000,
+            s1: l.sector1, s2: l.sector2, s3: l.sector3, compound: stint?.compound || null,
+          }
         }),
     }
   }))
+}
 
+function computeSectorDominance(driverPace, fieldS) {
   const teamS = { s1: 0, s2: 0, s3: 0, n: 0 }
   for (const d of driverPace)
     for (const l of d.laps)
       if (l.s1 && l.s2 && l.s3) { teamS.s1 += l.s1; teamS.s2 += l.s2; teamS.s3 += l.s3; teamS.n++ }
 
-  let sectorDominance = null
-  if (teamS.n > 0 && fieldS.n > 0) {
-    const tAvg = [teamS.s1 / teamS.n, teamS.s2 / teamS.n, teamS.s3 / teamS.n]
-    const fAvg = [fieldS.s1 / fieldS.n, fieldS.s2 / fieldS.n, fieldS.s3 / fieldS.n]
-    sectorDominance = [1, 2, 3].map((s, i) => ({
-      sector: `S${s}`,
-      teamAvg:  Math.round(tAvg[i] * 1000) / 1000,
-      fieldAvg: Math.round(fAvg[i] * 1000) / 1000,
-      delta:    Math.round((tAvg[i] - fAvg[i]) * 1000) / 1000,
-    }))
-  }
+  if (!teamS.n || !fieldS.n) return null
+  const tAvg = [teamS.s1 / teamS.n, teamS.s2 / teamS.n, teamS.s3 / teamS.n]
+  const fAvg = [fieldS.s1 / fieldS.n, fieldS.s2 / fieldS.n, fieldS.s3 / fieldS.n]
+  return [1, 2, 3].map((s, i) => ({
+    sector:   `S${s}`,
+    teamAvg:  Math.round(tAvg[i] * 1000) / 1000,
+    fieldAvg: Math.round(fAvg[i] * 1000) / 1000,
+    delta:    Math.round((tAvg[i] - fAvg[i]) * 1000) / 1000,
+  }))
+}
+
+export async function getTeamPace(teamName, year, requestedRaceId) {
+  const metaRows = await repo.queryRaceMetaByYear(year)
+  if (!metaRows.length) return null
+
+  const { teamDrivers, foundRaceId, foundRaceName, availableRaces } =
+    await findTeamRaceAndDrivers(metaRows, teamName, requestedRaceId)
+  if (!teamDrivers.length) return null
+
+  const allDriverRows = await repo.queryRaceDrivers(foundRaceId)
+  const { fieldAvgPerLap, fieldAvgLap, fieldS } = await computeFieldStats(foundRaceId, allDriverRows)
+  const driverPace    = await computeTeamDriverPace(foundRaceId, teamDrivers)
+  const sectorDominance = computeSectorDominance(driverPace, fieldS)
 
   return {
     raceId: foundRaceId, raceName: foundRaceName,

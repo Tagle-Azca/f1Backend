@@ -13,6 +13,7 @@
 import WebSocket from 'ws'
 import zlib from 'zlib'
 import { clearLiveSessionCache } from './openf1Live.js'
+import logger from '../utils/logger.js'
 
 const BASE        = 'https://livetiming.formula1.com'
 const WS_BASE     = 'wss://livetiming.formula1.com'
@@ -67,9 +68,7 @@ function saveSnapshot(final = false) {
   if (!key) return
   if (archivedSessionKey === key) return  // already archived
 
-  // For live snapshot: read state directly without going through getF1LiveClassification
-  // (which would return null if already archived)
-  const { SessionInfo, DriverList, TimingData, LapCount, TrackStatus } = state
+  const { SessionInfo, DriverList, TimingData } = state
   if (!SessionInfo || !DriverList || !TimingData?.Lines) return
 
   const full = getF1LiveClassification()
@@ -84,9 +83,9 @@ function saveSnapshot(final = false) {
 
   if (final) {
     archivedSessionKey = key
-    console.log(`[F1Live] snapshot final: ${full.sessionName} — ${full.raceName} (${full.classification.length} drivers)`)
+    logger.info(`[F1Live] snapshot final: ${full.sessionName} — ${full.raceName} (${full.classification.length} drivers)`)
     if (onFinalSnapshot) {
-      try { onFinalSnapshot(lastSessionSnapshot) } catch (e) { console.error('[F1Live] onFinalSnapshot error:', e.message) }
+      try { onFinalSnapshot(lastSessionSnapshot) } catch (e) { logger.error(`[F1Live] onFinalSnapshot error: ${e.message}`) }
     }
   }
 }
@@ -156,12 +155,12 @@ async function signalStart(token) {
   try {
     const resp = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(6000) })
     if (!resp.ok) {
-      console.warn(`[F1Live] /start returned ${resp.status}`)
+      logger.warn(`[F1Live] /start returned ${resp.status}`)
       return false
     }
     return true
   } catch (e) {
-    console.warn('[F1Live] /start failed:', e.message)
+    logger.warn(`[F1Live] /start failed: ${e.message}`)
     return false
   }
 }
@@ -216,18 +215,17 @@ function handleMessage(raw) {
       }
     }
     if (populated.length) {
-      console.log('[F1Live] initial state loaded:', populated.join(', '))
+      logger.info(`[F1Live] initial state loaded: ${populated.join(', ')}`)
       if (!sessionDataStartTime) {
         sessionDataStartTime = Date.now()
-        console.log('[F1Live] session data clock started')
+        logger.info('[F1Live] session data clock started')
       }
 
       // Auto-archive immediately if we reconnected to an already-finished race
-      // (LapCount present + CurrentLap >= TotalLaps). Prevents stale "live" state.
       const lc = state.LapCount
       if (lc?.TotalLaps > 0 && lc?.CurrentLap >= lc?.TotalLaps) {
-        console.log(`[F1Live] reconnected to finished race (lap ${lc.CurrentLap}/${lc.TotalLaps}) — archiving immediately`)
-        setTimeout(() => saveSnapshot(true), 500)  // slight delay to let all topics settle
+        logger.info(`[F1Live] reconnected to finished race (lap ${lc.CurrentLap}/${lc.TotalLaps}) — archiving immediately`)
+        setTimeout(() => saveSnapshot(true), 500)
       }
     }
   }
@@ -252,7 +250,6 @@ function handleMessage(raw) {
         const decoded = decompressZ(data)
         const entries = decoded?.Entries || []
         if (entries.length) {
-          // Keep only the latest reading per car (merge new channels into existing)
           const latest = entries[entries.length - 1].Cars || {}
           state.CarData = deepMerge(state.CarData || {}, latest)
         }
@@ -261,7 +258,7 @@ function handleMessage(raw) {
         const entries = decoded?.Entries || []
         if (entries.length) {
           const latest = entries[entries.length - 1].Cars || {}
-          if (!state.Position) console.log('[F1Live] first Position.z received, cars:', Object.keys(latest).length)
+          if (!state.Position) logger.info(`[F1Live] first Position.z received, cars: ${Object.keys(latest).length}`)
           state.Position = { ...(state.Position || {}), ...latest }
         }
       } else if (topic === 'TimingData' || topic === 'TimingAppData' || topic === 'DriverList') {
@@ -278,7 +275,7 @@ async function connectWs() {
   try {
     negotiateData = await negotiate()
   } catch (err) {
-    console.error('[F1Live] negotiate failed:', err.message)
+    logger.error(`[F1Live] negotiate failed: ${err.message}`)
     scheduleReconnect()
     return
   }
@@ -287,17 +284,16 @@ async function connectWs() {
   const sock  = new WebSocket(wsUrl, { headers: HEADERS })
 
   sock.on('open', () => {
-    // Wrap entire open logic in an async IIFE so any rejection is caught locally
     ;(async () => {
       connected = true
       reconnectCount = 0
-      clearLiveSessionCache()  // F1Live takes priority, OpenF1 cache no longer relevant
-      console.log('[F1Live] connected to livetiming.formula1.com')
+      clearLiveSessionCache()
+      logger.info('[F1Live] connected to livetiming.formula1.com')
 
       // SignalR 1.5 /start confirmation — retry once with fresh negotiate if it fails
       let startOk = await signalStart(negotiateData.ConnectionToken)
       if (!startOk) {
-        console.log('[F1Live] /start failed, re-negotiating...')
+        logger.info('[F1Live] /start failed, re-negotiating...')
         await new Promise(r => setTimeout(r, 2000))
         try {
           const fresh = await negotiate()
@@ -305,66 +301,59 @@ async function connectWs() {
           startOk = await signalStart(fresh.ConnectionToken)
         } catch (_) {}
         if (!startOk) {
-          console.warn('[F1Live] /start still failing — subscribing anyway')
+          logger.warn('[F1Live] /start still failing — subscribing anyway')
         }
       }
 
       // Subscribe to topics
-      const sub = JSON.stringify({
-        H: HUB,
-        M: 'Subscribe',
-        A: [TOPICS],
-        I: 1,
-      })
+      const sub = JSON.stringify({ H: HUB, M: 'Subscribe', A: [TOPICS], I: 1 })
       try { sock.send(sub) } catch (e) {
-        console.error('[F1Live] subscribe send error:', e.message)
+        logger.error(`[F1Live] subscribe send error: ${e.message}`)
         return
       }
 
       // Periodically save a snapshot and enforce max session duration (every 30s)
       const snapshotInterval = setInterval(() => {
         try {
-          // Already archived — nothing left to do this session
           if (archivedSessionKey) return
 
           if (!state.SessionInfo || !state.TimingData?.Lines) return
 
-          // Auto-archive if session has been "live" longer than SESSION_MAX_LIVE_MS
           const elapsed = sessionDataStartTime ? Date.now() - sessionDataStartTime : 0
           if (elapsed > SESSION_MAX_LIVE_MS) {
             const mins = Math.round(elapsed / 60_000)
-            console.log(`[F1Live] session exceeded ${mins}min limit — auto-archiving as completed`)
+            logger.info(`[F1Live] session exceeded ${mins}min limit — auto-archiving as completed`)
             saveSnapshot(true)
             return
           }
 
           saveSnapshot()
         } catch (e) {
-          console.error('[F1Live] snapshot interval error:', e.message)
+          logger.error(`[F1Live] snapshot interval error: ${e.message}`)
         }
       }, 30_000)
       sock.once('close', () => clearInterval(snapshotInterval))
-    })().catch(e => console.error('[F1Live] open handler error:', e.message))
+    })().catch(e => logger.error(`[F1Live] open handler error: ${e.message}`))
   })
 
   sock.on('message', (data) => {
     try { handleMessage(data.toString()) } catch (e) {
-      console.error('[F1Live] handleMessage error:', e.message)
+      logger.error(`[F1Live] handleMessage error: ${e.message}`)
     }
   })
 
   sock.on('close', (code, reason) => {
     connected = false
     sessionDataStartTime = null
-    clearLiveSessionCache()  // allow OpenF1 to recheck now that F1Live dropped
-    try { saveSnapshot(true) } catch (e) { console.error('[F1Live] saveSnapshot error on close:', e.message) }
-    state     = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, Position: null, LapCount: null, TrackStatus: null }
-    console.log(`[F1Live] disconnected (${code})`, reason?.toString() || '')
+    clearLiveSessionCache()
+    try { saveSnapshot(true) } catch (e) { logger.error(`[F1Live] saveSnapshot error on close: ${e.message}`) }
+    state = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, Position: null, LapCount: null, TrackStatus: null }
+    logger.info(`[F1Live] disconnected (${code}) ${reason?.toString() || ''}`)
     scheduleReconnect()
   })
 
   sock.on('error', (err) => {
-    console.error('[F1Live] ws error:', err.message)
+    logger.error(`[F1Live] ws error: ${err.message}`)
     // 'close' will follow
   })
 
@@ -372,10 +361,9 @@ async function connectWs() {
 }
 
 function scheduleReconnect() {
-  // If a session was archived, notify server.js to schedule the next session
   if (archivedSessionKey) {
-    console.log('[F1Live] session archived, requesting next session schedule')
-    if (onSessionArchived) setTimeout(onSessionArchived, 2_000)  // small delay so snapshot is ready
+    logger.info('[F1Live] session archived, requesting next session schedule')
+    if (onSessionArchived) setTimeout(onSessionArchived, 2_000)
     return
   }
   if (reconnecting) return
@@ -384,35 +372,33 @@ function scheduleReconnect() {
   reconnectCount++
   setTimeout(() => {
     reconnecting = false
-    connectWs().catch(e => console.error('[F1Live] reconnect error:', e.message))
+    connectWs().catch(e => logger.error(`[F1Live] reconnect error: ${e.message}`))
   }, RECONNECT_DELAY)
 }
 
 /**
  * Schedule a WebSocket connection 15 minutes before the given ISO session time.
- * Call this from server startup / schedule refresh with the next session datetime.
  */
 export function scheduleConnect(isoTime) {
   if (connectTimer) { clearTimeout(connectTimer); connectTimer = null }
 
-  const msUntil = new Date(isoTime) - Date.now() - 15 * 60_000  // 15 min early
+  const msUntil = new Date(isoTime) - Date.now() - 15 * 60_000
 
   if (msUntil <= 0) {
-    // Session is imminent or already started — connect now
-    console.log('[F1Live] session imminent, connecting now')
+    logger.info('[F1Live] session imminent, connecting now')
     archivedSessionKey   = null
     sessionDataStartTime = null
-    if (!connected && !reconnecting) connectWs().catch(e => console.error('[F1Live] connect error:', e.message))
+    if (!connected && !reconnecting) connectWs().catch(e => logger.error(`[F1Live] connect error: ${e.message}`))
     return
   }
 
   const eta = new Date(Date.now() + msUntil)
-  console.log(`[F1Live] next session ${isoTime} — will connect at ${eta.toISOString()} (${Math.round(msUntil / 60000)}min)`)
+  logger.info(`[F1Live] next session ${isoTime} — will connect at ${eta.toISOString()} (${Math.round(msUntil / 60000)}min)`)
   connectTimer = setTimeout(() => {
     connectTimer = null
-    archivedSessionKey   = null  // allow fresh session
-    sessionDataStartTime = null  // reset session clock
-    connectWs().catch(e => console.error('[F1Live] scheduled connect error:', e.message))
+    archivedSessionKey   = null
+    sessionDataStartTime = null
+    connectWs().catch(e => logger.error(`[F1Live] scheduled connect error: ${e.message}`))
   }, msUntil)
 }
 
@@ -423,7 +409,7 @@ export function scheduleConnect(isoTime) {
  * via refreshF1Schedule() in server.js — do NOT connect unconditionally.
  */
 export function startF1LiveTiming() {
-  console.log('[F1Live] timing service initialized — waiting for schedule')
+  logger.info('[F1Live] timing service initialized — waiting for schedule')
 }
 
 /**
@@ -472,12 +458,7 @@ export function getF1LiveTop3() {
       const gap = pos === 1
         ? 'LEADER'
         : line.GapToLeader || line.IntervalToPositionAhead?.Value || null
-      return {
-        ...driverEntry(num),
-        position:  pos,
-        stat:      gap,
-        statLabel: 'gap',
-      }
+      return { ...driverEntry(num), position: pos, stat: gap, statLabel: 'gap' }
     })
 
     return { sessionName, raceName, isRaceType, top3, currentLap }
@@ -542,7 +523,6 @@ export function getF1LiveClassification() {
 
   if (!SessionInfo || !DriverList || !TimingData?.Lines) return null
 
-  // Session already archived (finished + snapshotted) — treat as no active session
   const key = `${SessionInfo.Meeting?.Name || ''}|${SessionInfo.Name || SessionInfo.Type || ''}`
   if (archivedSessionKey === key) return null
 
@@ -566,7 +546,7 @@ export function getF1LiveClassification() {
     const channels = state.CarData?.[num]?.Channels || {}
     const throttle = channels[4] != null ? Math.round(channels[4]) : null
     const brake    = channels[5] != null ? Math.min(100, Math.round(channels[5])) : null
-    const gear     = channels[0] != null ? Math.round(channels[0]) : null  // 0=N, 1-8
+    const gear     = channels[0] != null ? Math.round(channels[0]) : null
     return {
       driverNum: num,
       acronym:   d.Tla        || num,
@@ -581,8 +561,7 @@ export function getF1LiveClassification() {
     }
   }
 
-  // ── Pre-compute best sector times across all drivers (for purple) ──────────
-  // F1 sector Status values: 2048=yellow, 2049=green(personal best), 2051=purple(session best)
+  // Pre-compute best sector times across all drivers (for purple)
   const bestSectorTimes = [Infinity, Infinity, Infinity]
   for (const l of Object.values(lines)) {
     const secs = l.Sectors || {}
@@ -671,11 +650,6 @@ export function getF1LiveClassification() {
   return { sessionName, raceName, isRaceType, classification, trackStatus, currentLap, totalLaps, finished }
 }
 
-/**
- * Returns the snapshot of the most recently completed session,
- * useful when Jolpica hasn't published results yet.
- * Shape: { sessionName, raceName, isRaceType, top3, currentLap, savedAt }
- */
 export function saveSessionSnapshot() { saveSnapshot() }
 
 export function getLastSessionSnapshot() {

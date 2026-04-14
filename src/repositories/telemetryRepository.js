@@ -76,3 +76,15 @@ export async function queryRaceMetaByYear(year) {
     'SELECT race_id, race_name FROM race_meta WHERE year = ? ALLOW FILTERING',
     [parseInt(year)])
 }
+
+export async function queryRaceIdsByDriverId(driverId) {
+  return cassandraQuery(
+    'SELECT race_id FROM race_drivers WHERE driver_id = ? ALLOW FILTERING',
+    [driverId])
+}
+
+export async function queryAllLapTimesByRace(raceId) {
+  return cassandraQuery(
+    'SELECT driver_id, lap_time FROM lap_times WHERE race_id = ? ALLOW FILTERING',
+    [raceId])
+}

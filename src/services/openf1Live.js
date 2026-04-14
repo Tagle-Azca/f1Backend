@@ -1,327 +1,213 @@
-/**
- * OpenF1 Live Proxy Service
- *
- * When a raceId is not yet seeded in Cassandra (e.g. a race that happened today),
- * these helpers fetch the same data directly from OpenF1 and return it in the
- * exact same shape the telemetry controller would produce from Cassandra.
- *
- * raceId format is identical to the seeder: "{year}_{session_key}"
- * driverId format is identical to the seeder: String(driver_number)
- */
+import logger from '../utils/logger.js'
+import { fmtLapTime } from '../utils/formatters.js'
+import * as repo from '../repositories/openf1Repository.js'
 
-const OPENF1  = 'https://api.openf1.org/v1'
-// Browser-like headers — prevents 401/403 blocks from OpenF1's UA filter
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept':     '*/*',
-  'Referer':    'https://www.formula1.com/',
-}
-const TIMEOUT = 25000  // historical race datasets (positions, laps) can be large
+// ── Session detection state ───────────────────────────────────────────────────
 
-// In-memory cache per session_key to avoid redundant OpenF1 round-trips
-const cache = new Map()
+let _liveSessionCache    = null  // { result, expiresAt }
+let _liveSessionInFlight = null
 
-const sleep = ms => new Promise(r => setTimeout(r, ms))
+// Injected by server.js at startup to break the circular import:
+// f1LiveTiming.js already imports from openf1Live.js, so openf1Live.js
+// cannot import from f1LiveTiming.js directly.
+let _getF1LiveState = null
+export function setF1LiveStateGetter(fn) { _getF1LiveState = fn }
 
-async function of1Fetch(path, retries = 3, backoff = 1200) {
-  const resp = await fetch(`${OPENF1}${path}`, {
-    headers: HEADERS,
-    signal:  AbortSignal.timeout(TIMEOUT),
-  })
-  if (resp.status === 429 && retries > 0) {
-    await sleep(backoff)
-    return of1Fetch(path, retries - 1, backoff * 2)
-  }
-  if (!resp.ok) throw new Error(`OpenF1 ${resp.status} ${path}`)
-  return resp.json()
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-function cacheKey(sessionKey, resource) {
-  return `${sessionKey}:${resource}`
-}
-
-// In-flight promise deduplication — prevents concurrent identical requests
-// both triggering separate OpenF1 calls and hitting rate limits
-const inFlight = new Map()
-
-async function cachedFetch(sessionKey, resource, path) {
-  const k = cacheKey(sessionKey, resource)
-  if (cache.has(k)) return cache.get(k)
-
-  // If the same request is already in flight, wait for it instead of firing a new one
-  if (inFlight.has(k)) return inFlight.get(k)
-
-  const promise = of1Fetch(path).then(data => {
-    cache.set(k, data)
-    inFlight.delete(k)
-    return data
-  }).catch(err => {
-    inFlight.delete(k)
-    throw err
-  })
-
-  inFlight.set(k, promise)
-  return promise
-}
-
-// ── Helpers ──────────────────────────────────────────────────
-
-/** Extract the OpenF1 session_key from our internal raceId format */
 export function sessionKeyFromRaceId(raceId) {
   const key = parseInt(raceId?.split('_')[1])
   return isNaN(key) ? null : key
 }
 
-/**
- * Find the most recent/current Race session from OpenF1 for the current year
- * that falls inside a "live window": started within the last 7 days or
- * starts within the next 4 days (covers the full race weekend).
- * Returns { raceId, raceName, sessionKey, year } or null.
- */
+export function clearLiveSessionCache() {
+  _liveSessionCache = null
+}
+
+// ── Session detection ─────────────────────────────────────────────────────────
+
 export async function findLiveRaceSession() {
   try {
-    // Probe location data — no /sessions auth required.
-    // If there's data from the last 30 minutes, assume a live race weekend.
-    const since = new Date(Date.now() - 30 * 60_000).toISOString()
-    const data  = await of1Fetch(`/location?session_key=latest&date_gt=${since}&driver_number=1`)
+    const data = await repo.fetchLatestLocation(30 * 60_000)
     if (!Array.isArray(data) || !data.length) return null
 
-    const entry = data[0]
-    const sessionKey = entry.session_key
+    const sessionKey = data[0].session_key
     const year       = new Date().getFullYear()
+    const raceName   = _getF1LiveState?.()?.raceName || `Race ${sessionKey}`
 
-    // Use F1 Live state for race name if available
-    const f1live  = _getF1LiveState?.()
-    const raceName = f1live?.raceName || `Race ${sessionKey}`
-
-    return {
-      raceId:     `${year}_${sessionKey}`,
-      raceName,
-      sessionKey,
-      year:       String(year),
-      isLive:     true,
-    }
+    return { raceId: `${year}_${sessionKey}`, raceName, sessionKey, year: String(year), isLive: true }
   } catch {
     return null
   }
 }
 
-// Max duration (ms) per session — generous to handle red flags, delays, pauses
-const SESSION_MAX_DURATION = {
-  'Practice 1':      120 * 60 * 1000,
-  'Practice 2':      120 * 60 * 1000,
-  'Practice 3':      120 * 60 * 1000,
-  'Sprint Shootout':  90 * 60 * 1000,
-  'Sprint':           90 * 60 * 1000,
-  'Qualifying':      150 * 60 * 1000,  // Q1+Q2+Q3 with delays can hit 2h+
-  'Race':            240 * 60 * 1000,  // 4h for safety cars / suspensions
-}
-
-// Cache for findLiveSession: { result, expiresAt }
-// Active session → refresh every 30s | No session → don't retry for 5 min
-let _liveSessionCache = null
-
-/**
- * Find ANY currently active F1 session (FP, Qualifying, Sprint, Race).
- * A session is "active" if it started and is within its estimated max duration.
- * Returns { sessionKey, sessionName, raceName, isRaceType } or null.
- */
-/**
- * Injected by server.js at startup so we can read F1 Live state without
- * creating a circular import (f1LiveTiming.js already imports from us).
- */
-let _getF1LiveState = null
-export function setF1LiveStateGetter(fn) { _getF1LiveState = fn }
-
+// Active sessions cached 30s; no-session result held 5 min to avoid hammering OpenF1.
 export async function findLiveSession() {
   const now = Date.now()
 
-  // Return cached result if still fresh
-  if (_liveSessionCache && now < _liveSessionCache.expiresAt) {
+  if (_liveSessionCache && now < _liveSessionCache.expiresAt)
     return _liveSessionCache.result
-  }
 
-  try {
-    // Probe /location with session_key=latest — no auth needed, no /sessions call.
-    // A non-empty result means a session is currently active.
-    const since = new Date(now - 3 * 60_000).toISOString()
-    const data  = await of1Fetch(`/location?session_key=latest&date_gt=${since}&driver_number=1`)
+  if (_liveSessionInFlight) return _liveSessionInFlight
 
-    if (!Array.isArray(data) || !data.length) {
-      _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
-      return null
-    }
+  _liveSessionInFlight = (async () => {
+    try {
+      const data = await repo.fetchLatestLocation(3 * 60_000)
 
-    const sessionKey = data[0].session_key
-
-    // Fill session_name / raceName / isRaceType from the F1 Live state when available
-    // (avoids any additional OpenF1 call that might require auth)
-    const f1live     = _getF1LiveState?.()
-    const sessionName = f1live?.sessionName || 'Race'
-    const raceName    = f1live?.raceName    || ''
-    const isRaceType  = f1live?.isRaceType  ?? (sessionName === 'Race' || sessionName === 'Sprint')
-
-    const result = { sessionKey, sessionName, raceName, isRaceType }
-    console.log(`[Live] findLiveSession: LIVE → ${sessionName} key=${sessionKey}`)
-    _liveSessionCache = { result, expiresAt: now + 30_000 }
-    return result
-  } catch (err) {
-    console.error('[Live] findLiveSession error:', err.message)
-    _liveSessionCache = { result: null, expiresAt: now + 60_000 }
-    return null
-  }
-}
-
-/** Force-clear the live session cache (e.g. when F1Live connects/disconnects) */
-export function clearLiveSessionCache() {
-  _liveSessionCache = null
-}
-
-// ── Live timing (dashboard) ───────────────────────────────────
-
-/**
- * Fetch top-3 for the dashboard.
- * - Race / Sprint → positions + gaps (from /position + /intervals)
- * - FP / Qualifying / Sprint Shootout → fastest lap times (from /laps, all session)
- * Returns null if no data is available yet.
- */
-export async function getLiveTop3(sessionKey, isRaceType) {
-  const drvData   = await cachedFetch(sessionKey, 'drivers', `/drivers?session_key=${sessionKey}`)
-  const driverMap = new Map(drvData.map(d => [d.driver_number, d]))
-
-  if (isRaceType) {
-    // ── Race / Sprint: positions + gaps ────────────────────
-    const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString()
-
-    const [posResult, intResult, lapResult] = await Promise.allSettled([
-      of1Fetch(`/position?session_key=${sessionKey}&date>=${twoMinAgo}`),
-      of1Fetch(`/intervals?session_key=${sessionKey}&date>=${twoMinAgo}`),
-      of1Fetch(`/laps?session_key=${sessionKey}&date>=${twoMinAgo}`),
-    ])
-
-    const posData = posResult.status === 'fulfilled' ? posResult.value : []
-    const intData = intResult.status === 'fulfilled' ? intResult.value : []
-    const lapData = lapResult.status === 'fulfilled' ? lapResult.value : []
-
-    if (!posData.length) return null
-
-    const latestPos = new Map()
-    for (const p of posData) {
-      const e = latestPos.get(p.driver_number)
-      if (!e || p.date > e.date) latestPos.set(p.driver_number, p)
-    }
-    const latestInt = new Map()
-    for (const i of intData) {
-      const e = latestInt.get(i.driver_number)
-      if (!e || i.date > e.date) latestInt.set(i.driver_number, i)
-    }
-    const currentLap = lapData.length ? Math.max(...lapData.map(l => l.lap_number || 0)) : null
-
-    const top3 = [...latestPos.values()]
-      .sort((a, b) => a.position - b.position)
-      .slice(0, 3)
-      .map(p => {
-        const d = driverMap.get(p.driver_number) || {}
-        const i = latestInt.get(p.driver_number) || {}
-        return {
-          position:  p.position,
-          driverNum: p.driver_number,
-          acronym:   d.name_acronym || String(p.driver_number),
-          teamName:  d.team_name    || '',
-          teamColor: d.team_colour  ? `#${d.team_colour}` : null,
-          stat:      p.position === 1 ? 'LEADER' : (i.gap_to_leader || null),
-          statLabel: 'gap',
-        }
-      })
-
-    return { top3, currentLap }
-
-  } else {
-    // ── FP / Qualifying: fastest lap times ────────────────
-    // Fetch ALL laps for the session (no time filter — we want the fastest ever set)
-    const lapData = await cachedFetch(sessionKey, 'laps', `/laps?session_key=${sessionKey}`)
-    if (!Array.isArray(lapData) || !lapData.length) return null
-
-    // Best lap per driver (smallest lap_duration, ignore nulls and obvious out-laps >200s)
-    const bestPerDriver = new Map()
-    for (const l of lapData) {
-      if (!l.lap_duration || l.lap_duration > 200) continue
-      const existing = bestPerDriver.get(l.driver_number)
-      if (!existing || l.lap_duration < existing.lap_duration) {
-        bestPerDriver.set(l.driver_number, l)
+      if (!Array.isArray(data) || !data.length) {
+        _liveSessionCache = { result: null, expiresAt: now + 5 * 60_000 }
+        return null
       }
+
+      const sessionKey  = data[0].session_key
+      const f1live      = _getF1LiveState?.()
+      const sessionName = f1live?.sessionName || 'Race'
+      const raceName    = f1live?.raceName    || ''
+      const isRaceType  = f1live?.isRaceType  ?? (sessionName === 'Race' || sessionName === 'Sprint')
+
+      const result = { sessionKey, sessionName, raceName, isRaceType }
+      logger.info({ sessionKey, sessionName }, '[Live] active session detected')
+      _liveSessionCache = { result, expiresAt: now + 30_000 }
+      return result
+    } catch (err) {
+      const isNoData = err.message?.includes('404')
+      const backoff  = isNoData ? 5 * 60_000 : 60_000
+      if (!isNoData) logger.error({ err: err.message }, '[Live] findLiveSession error')
+      _liveSessionCache = { result: null, expiresAt: now + backoff }
+      return null
+    } finally {
+      _liveSessionInFlight = null
     }
+  })()
 
-    if (!bestPerDriver.size) return null
+  return _liveSessionInFlight
+}
 
-    const sorted = [...bestPerDriver.values()].sort((a, b) => a.lap_duration - b.lap_duration)
-    const fastestTime = sorted[0]?.lap_duration
+// ── Live top-3 ────────────────────────────────────────────────────────────────
 
-    const top3 = sorted.slice(0, 3).map((l, i) => {
-      const d   = driverMap.get(l.driver_number) || {}
-      const gap = i === 0 ? null : +(l.lap_duration - fastestTime).toFixed(3)
-      const m   = Math.floor(l.lap_duration / 60)
-      const s   = (l.lap_duration % 60).toFixed(3).padStart(6, '0')
+// Race/Sprint: 2-minute rolling window avoids fetching the entire session history
+async function getLiveTop3ForRace(sessionKey, driverMap) {
+  const twoMinAgo = new Date(Date.now() - 2 * 60_000).toISOString()
+
+  const [posResult, intResult, lapResult] = await Promise.allSettled([
+    repo.fetchRecentPositions(sessionKey, twoMinAgo),
+    repo.fetchRecentIntervals(sessionKey, twoMinAgo),
+    repo.fetchRecentLaps(sessionKey, twoMinAgo),
+  ])
+
+  const posData = posResult.status === 'fulfilled' ? posResult.value : []
+  const intData = intResult.status === 'fulfilled' ? intResult.value : []
+  const lapData = lapResult.status === 'fulfilled' ? lapResult.value : []
+
+  if (!posData.length) return null
+
+  const latestPos = new Map()
+  for (const p of posData) {
+    const e = latestPos.get(p.driver_number)
+    if (!e || p.date > e.date) latestPos.set(p.driver_number, p)
+  }
+  const latestInt = new Map()
+  for (const i of intData) {
+    const e = latestInt.get(i.driver_number)
+    if (!e || i.date > e.date) latestInt.set(i.driver_number, i)
+  }
+
+  const currentLap = lapData.length ? Math.max(...lapData.map(l => l.lap_number || 0)) : null
+
+  const top3 = [...latestPos.values()]
+    .sort((a, b) => a.position - b.position)
+    .slice(0, 3)
+    .map(p => {
+      const d = driverMap.get(p.driver_number) || {}
+      const i = latestInt.get(p.driver_number) || {}
       return {
-        position:  i + 1,
-        driverNum: l.driver_number,
-        acronym:   d.name_acronym || String(l.driver_number),
+        position:  p.position,
+        driverNum: p.driver_number,
+        acronym:   d.name_acronym || String(p.driver_number),
         teamName:  d.team_name    || '',
         teamColor: d.team_colour  ? `#${d.team_colour}` : null,
-        stat:      `${m}:${s}`,
-        statLabel: gap !== null ? `+${gap.toFixed(3)}` : 'fastest',
+        stat:      p.position === 1 ? 'LEADER' : (i.gap_to_leader || null),
+        statLabel: 'gap',
       }
     })
 
-    return { top3, currentLap: null }
+  return { top3, currentLap }
+}
+
+// FP/Qualifying: fastest lap per driver across the full session
+async function getLiveTop3ForQualifying(sessionKey, driverMap) {
+  const lapData = await repo.fetchLaps(sessionKey)
+  if (!Array.isArray(lapData) || !lapData.length) return null
+
+  // Ignore nulls and out-laps (> 200 s)
+  const bestPerDriver = new Map()
+  for (const l of lapData) {
+    if (!l.lap_duration || l.lap_duration > 200) continue
+    const existing = bestPerDriver.get(l.driver_number)
+    if (!existing || l.lap_duration < existing.lap_duration)
+      bestPerDriver.set(l.driver_number, l)
   }
+
+  if (!bestPerDriver.size) return null
+
+  const sorted      = [...bestPerDriver.values()].sort((a, b) => a.lap_duration - b.lap_duration)
+  const fastestTime = sorted[0].lap_duration
+
+  const top3 = sorted.slice(0, 3).map((l, i) => {
+    const d   = driverMap.get(l.driver_number) || {}
+    const gap = i === 0 ? null : +(l.lap_duration - fastestTime).toFixed(3)
+    return {
+      position:  i + 1,
+      driverNum: l.driver_number,
+      acronym:   d.name_acronym || String(l.driver_number),
+      teamName:  d.team_name    || '',
+      teamColor: d.team_colour  ? `#${d.team_colour}` : null,
+      stat:      fmtLapTime(l.lap_duration),
+      statLabel: gap !== null ? `+${gap.toFixed(3)}` : 'fastest',
+    }
+  })
+
+  return { top3, currentLap: null }
 }
 
-// ── Short-lived cache for live timing (5 s TTL) ──────────────
-
-const ttlCache = new Map() // key → { data, expiresAt }
-
-async function ttlFetch(key, path, ttlMs = 5000) {
-  const hit = ttlCache.get(key)
-  if (hit && Date.now() < hit.expiresAt) return hit.data
-  const data = await of1Fetch(path)
-  ttlCache.set(key, { data, expiresAt: Date.now() + ttlMs })
-  return data
+export async function getLiveTop3(sessionKey, isRaceType) {
+  const drvData   = await repo.fetchDrivers(sessionKey)
+  const driverMap = new Map(drvData.map(d => [d.driver_number, d]))
+  return isRaceType
+    ? getLiveTop3ForRace(sessionKey, driverMap)
+    : getLiveTop3ForQualifying(sessionKey, driverMap)
 }
 
-function fmtLap(sec) {
-  if (!sec) return null
-  const m = Math.floor(sec / 60)
-  const s = (sec % 60).toFixed(3).padStart(6, '0')
-  return `${m}:${s}`
+// ── Timing tower ──────────────────────────────────────────────────────────────
+
+function sectorColor(driverBest, sessionBest) {
+  if (!driverBest || driverBest === Infinity) return null
+  return Math.abs(driverBest - sessionBest) < 0.001 ? 'purple' : 'green'
 }
 
-/**
- * Full timing tower for FP / Qualifying / Race.
- * Returns sector color coding: 'purple' (session best), 'green' (personal best), 'yellow'.
- */
 export async function getLiveTimingTower(sessionKey, isRaceType) {
   const [laps, stints, drivers] = await Promise.all([
-    ttlFetch(`laps:${sessionKey}`,    `/laps?session_key=${sessionKey}`),
-    ttlFetch(`stints:${sessionKey}`,  `/stints?session_key=${sessionKey}`),
-    ttlFetch(`drivers:${sessionKey}`, `/drivers?session_key=${sessionKey}`),
+    repo.fetchLapsLive(sessionKey),
+    repo.fetchStintsLive(sessionKey),
+    repo.fetchDriversLive(sessionKey),
   ])
 
   const driverMap = new Map(drivers.map(d => [d.driver_number, d]))
 
-  // ── Best sectors per driver + session bests ───────────────
-  const bestPerDriver = new Map() // num → { lap, s1, s2, s3, lapCount }
+  // Accumulate personal bests and session bests in a single pass
+  const bestPerDriver = new Map()
   let sessionBestS1 = Infinity, sessionBestS2 = Infinity, sessionBestS3 = Infinity
 
   for (const l of laps) {
     if (!l.lap_duration || l.lap_duration > 200) continue
     const num = l.driver_number
-    const cur = bestPerDriver.get(num) || { lap: Infinity, s1: Infinity, s2: Infinity, s3: Infinity, lapCount: 0 }
+    const cur = bestPerDriver.get(num)
+      || { lap: Infinity, s1: Infinity, s2: Infinity, s3: Infinity, lapCount: 0 }
 
-    if (l.lap_duration < cur.lap) cur.lap = l.lap_duration
-    if (l.duration_sector_1 && l.duration_sector_1 < cur.s1) cur.s1 = l.duration_sector_1
-    if (l.duration_sector_2 && l.duration_sector_2 < cur.s2) cur.s2 = l.duration_sector_2
-    if (l.duration_sector_3 && l.duration_sector_3 < cur.s3) cur.s3 = l.duration_sector_3
+    if (l.lap_duration      < cur.lap) cur.lap = l.lap_duration
+    if (l.duration_sector_1 < cur.s1)  cur.s1  = l.duration_sector_1
+    if (l.duration_sector_2 < cur.s2)  cur.s2  = l.duration_sector_2
+    if (l.duration_sector_3 < cur.s3)  cur.s3  = l.duration_sector_3
     cur.lapCount++
     bestPerDriver.set(num, cur)
 
@@ -332,257 +218,57 @@ export async function getLiveTimingTower(sessionKey, isRaceType) {
 
   if (!bestPerDriver.size) return null
 
-  // ── Current compound per driver (latest stint) ────────────
+  // Latest stint per driver → current compound
   const compoundMap = new Map()
   for (const s of stints) {
     const cur = compoundMap.get(s.driver_number)
     if (!cur || s.stint_number > cur.stint_number) compoundMap.set(s.driver_number, s)
   }
 
-  // ── Sort by best lap, build result ────────────────────────
-  const sorted = [...bestPerDriver.entries()]
-    .sort((a, b) => a[1].lap - b[1].lap)
-
+  const sorted     = [...bestPerDriver.entries()].sort((a, b) => a[1].lap - b[1].lap)
   const leaderTime = sorted[0]?.[1]?.lap
 
-  const sectorColor = (driverBest, sessionBest) => {
-    if (!driverBest || driverBest === Infinity) return null
-    if (Math.abs(driverBest - sessionBest) < 0.001) return 'purple'
-    return 'green'
-  }
-
-  const result = sorted.map(([num, best], i) => {
-    const d       = driverMap.get(num) || {}
-    const stint   = compoundMap.get(num)
-    const gap     = i === 0 ? null : +(best.lap - leaderTime).toFixed(3)
-
+  return sorted.map(([num, best], i) => {
+    const d     = driverMap.get(num) || {}
+    const stint = compoundMap.get(num)
+    const gap   = i === 0 ? null : +(best.lap - leaderTime).toFixed(3)
     return {
-      position:    i + 1,
-      driverNum:   num,
-      acronym:     d.name_acronym || String(num),
-      teamName:    d.team_name    || '',
-      teamColor:   d.team_colour  ? `#${d.team_colour}` : null,
-      compound:    stint ? (stint.compound || 'UNKNOWN').toUpperCase() : null,
-      laps:        best.lapCount,
-      bestLap:     best.lap,
-      bestLapStr:  fmtLap(best.lap),
+      position:   i + 1,
+      driverNum:  num,
+      acronym:    d.name_acronym || String(num),
+      teamName:   d.team_name    || '',
+      teamColor:  d.team_colour  ? `#${d.team_colour}` : null,
+      compound:   stint ? (stint.compound || 'UNKNOWN').toUpperCase() : null,
+      laps:       best.lapCount,
+      bestLap:    best.lap,
+      bestLapStr: fmtLapTime(best.lap),
       gap,
-      gapStr:      gap === null ? 'LEADER' : `+${gap.toFixed(3)}`,
+      gapStr:     gap === null ? 'LEADER' : `+${gap.toFixed(3)}`,
       s1: best.s1 < Infinity ? { time: +best.s1.toFixed(3), color: sectorColor(best.s1, sessionBestS1) } : null,
       s2: best.s2 < Infinity ? { time: +best.s2.toFixed(3), color: sectorColor(best.s2, sessionBestS2) } : null,
       s3: best.s3 < Infinity ? { time: +best.s3.toFixed(3), color: sectorColor(best.s3, sessionBestS3) } : null,
     }
   })
-
-  return result
 }
 
-// ── Per-endpoint live fetchers ────────────────────────────────
+// ── Live car data ─────────────────────────────────────────────────────────────
 
-export async function getLiveDrivers(sessionKey) {
-  const drivers = await cachedFetch(sessionKey, 'drivers', `/drivers?session_key=${sessionKey}`)
-  return drivers.map(d => ({
-    driverId: String(d.driver_number),
-    acronym:  d.name_acronym || '',
-    fullName: d.full_name    || '',
-    teamName: d.team_name    || '',
-  }))
-}
-
-export async function getLiveLapTimes(sessionKey, driverId) {
-  const [laps, allStints] = await Promise.all([
-    of1Fetch(`/laps?session_key=${sessionKey}&driver_number=${driverId}`),
-    cachedFetch(sessionKey, 'stints', `/stints?session_key=${sessionKey}`),
-  ])
-
-  const driverStints = allStints.filter(s => String(s.driver_number) === String(driverId))
-
-  return laps
-    .filter(l => l.lap_duration != null && l.lap_duration > 0 && parseFloat(l.lap_duration) <= 300)
-    .map(l => {
-      const stint = driverStints.find(s => l.lap_number >= s.lap_start && l.lap_number <= s.lap_end)
-      return {
-        lap_number: l.lap_number,
-        lap_time:   parseFloat(l.lap_duration),
-        sector1:    l.duration_sector_1 != null ? parseFloat(l.duration_sector_1) : null,
-        sector2:    l.duration_sector_2 != null ? parseFloat(l.duration_sector_2) : null,
-        sector3:    l.duration_sector_3 != null ? parseFloat(l.duration_sector_3) : null,
-        compound:   stint ? (stint.compound || 'UNKNOWN').toUpperCase() : null,
-      }
-    })
-}
-
-export async function getLivePitStops(sessionKey, driverId) {
-  const pits = await of1Fetch(`/pit?session_key=${sessionKey}&driver_number=${driverId}`)
-  return pits
-    .filter(p => p.pit_duration && p.pit_duration >= 2)
-    .sort((a, b) => a.lap_number - b.lap_number)
-    .map((p, i) => ({
-      stop_number: i + 1,
-      lap:         p.lap_number,
-      duration:    parseFloat(p.pit_duration),
-      time:        p.date || '',
-    }))
-}
-
-export async function getLiveRacePace(sessionKey, driverIds) {
-  return Promise.all(driverIds.map(async driverId => {
-    const [laps, pits] = await Promise.all([
-      of1Fetch(`/laps?session_key=${sessionKey}&driver_number=${driverId}`),
-      of1Fetch(`/pit?session_key=${sessionKey}&driver_number=${driverId}`),
-    ])
-    const pitLapSet = new Set(
-      pits.filter(p => p.pit_duration && p.pit_duration >= 2).map(p => p.lap_number)
-    )
-    return {
-      driverId,
-      laps: laps
-        .filter(l => l.lap_duration != null && l.lap_duration > 0 && parseFloat(l.lap_duration) <= 300)
-        .map(l => ({
-          lap:   l.lap_number,
-          time:  parseFloat(l.lap_duration),
-          isPit: pitLapSet.has(l.lap_number),
-        })),
-    }
-  }))
-}
-
-export async function getLiveTireStrategy(sessionKey) {
-  // Sequential to avoid hitting OpenF1 rate limits with concurrent requests
-  const stints  = await cachedFetch(sessionKey, 'stints',  `/stints?session_key=${sessionKey}`)
-  const drivers = await cachedFetch(sessionKey, 'drivers', `/drivers?session_key=${sessionKey}`)
-
-  const driverMap = new Map(drivers.map(d => [d.driver_number, d]))
-  const byDriver  = new Map()
-
-  for (const s of stints) {
-    const num = s.driver_number
-    if (!byDriver.has(num)) byDriver.set(num, [])
-    byDriver.get(num).push({
-      stintNumber: s.stint_number,
-      compound:    (s.compound || 'UNKNOWN').toUpperCase(),
-      lapStart:    s.lap_start,
-      lapEnd:      s.lap_end,
-      tyreAge:     s.tyre_age_at_start || 0,
-    })
-  }
-
-  return [...byDriver.entries()]
-    .map(([num, driverStints]) => {
-      const d = driverMap.get(num)
-      return {
-        driverId: String(num),
-        acronym:  d?.name_acronym || String(num),
-        fullName: d?.full_name    || '',
-        teamName: d?.team_name    || '',
-        stints:   driverStints.sort((a, b) => a.stintNumber - b.stintNumber),
-      }
-    })
-    .sort((a, b) => a.acronym.localeCompare(b.acronym))
-}
-
-// ── Safety Car / VSC periods ──────────────────────────────────
-
-/**
- * Fetch race control events and return SC/VSC periods as
- * [{ type: 'SC'|'VSC', lapStart, lapEnd }] sorted by lapStart.
- * Works for any sessionKey — historical or live.
- */
-export async function getSafetyCarPeriods(sessionKey) {
-  const events = await cachedFetch(sessionKey, 'race_control', `/race_control?session_key=${sessionKey}`)
-  if (!Array.isArray(events) || !events.length) return []
-
-  // Sort by timestamp — lap_number can be null on end-of-SC events, so date is more reliable
-  const sorted = [...events].sort((a, b) => {
-    const ta = new Date(a.date || 0).getTime()
-    const tb = new Date(b.date || 0).getTime()
-    if (ta !== tb) return ta - tb
-    return (a.lap_number ?? 0) - (b.lap_number ?? 0)
-  })
-
-  // Debug: log SC/VSC related events to server console
-  const relevant = sorted.filter(e => {
-    const t = `${e.category} ${e.flag} ${e.message}`.toUpperCase()
-    return t.includes('SAFETY') || t.includes('VSC') || t.includes('VIRTUAL')
-  })
-  if (relevant.length) {
-    console.log(`[SC] session=${sessionKey} events:`,
-      relevant.map(e => `lap=${e.lap_number ?? 'null'} cat=${e.category} flag=${e.flag} msg=${e.message}`))
-  }
-
-  const periods = []
-  let openSC  = null  // { type: 'SC',  lapStart }
-  let openVSC = null  // { type: 'VSC', lapStart }
-  let lastKnownLap = 1
-
-  for (const e of sorted) {
-    // Use lap_number if present; otherwise fall back to last known lap
-    const lap = e.lap_number != null ? e.lap_number : lastKnownLap
-    if (e.lap_number != null) lastKnownLap = e.lap_number
-
-    const flag = (e.flag     || '').toUpperCase().trim()
-    const msg  = (e.message  || '').toUpperCase().trim()
-    const cat  = (e.category || '').toLowerCase().trim()
-    const text = `${flag} ${msg}`
-
-    // ── VSC ──────────────────────────────────────────
-    // OpenF1 sometimes uses cat=SafetyCar with msg='VSC DEPLOYED' instead of cat=vsc
-    const isVSC = cat === 'vsc'
-      || msg.includes('VSC')
-      || (text.includes('VIRTUAL') && text.includes('SAFETY'))
-    if (isVSC) {
-      if (text.includes('DEPLOY')) {
-        if (openVSC) periods.push({ ...openVSC, lapEnd: lap })
-        openVSC = { type: 'VSC', lapStart: lap }
-      } else if (text.includes('END') || text.includes('IN THIS') || text.includes('CLEAR')) {
-        if (openVSC) { periods.push({ ...openVSC, lapEnd: lap + 1 }); openVSC = null }
-      }
-    }
-    // ── SC (not VSC) ─────────────────────────────────
-    else if (cat === 'safetycar' || (text.includes('SAFETY CAR') && !text.includes('VIRTUAL') && !msg.includes('VSC'))) {
-      if (text.includes('DEPLOY')) {
-        if (openSC) periods.push({ ...openSC, lapEnd: lap })
-        openSC = { type: 'SC', lapStart: lap }
-      } else if (text.includes('IN THIS') || text.includes('WITHDRAWN') || text.includes('CLEAR') || text.includes('END')) {
-        if (openSC) { periods.push({ ...openSC, lapEnd: lap + 1 }); openSC = null }
-      }
-    }
-  }
-
-  // Safety net: cap unclosed periods — SC rarely runs more than 8 laps, VSC more than 5
-  if (openSC)  periods.push({ ...openSC,  lapEnd: openSC.lapStart  + 8 })
-  if (openVSC) periods.push({ ...openVSC, lapEnd: openVSC.lapStart + 5 })
-
-  return periods
-    .filter(p => p.lapEnd > p.lapStart)
-    .sort((a, b) => a.lapStart - b.lapStart)
-}
-
-/**
- * Fetches location + car_data in parallel using session_key=latest.
- * Avoids the year-based /sessions query that now requires auth (401).
- * Returns { positions: { driverNum: {x,y} }, telemetry: { driverNum: {rpm,gear,throttle,brake,drs,speed} } }
- */
 export async function getLiveCarData() {
-  const since = new Date(Date.now() - 5_000).toISOString()
-
+  const SINCE_MS = 5_000
   const [locResult, carResult] = await Promise.allSettled([
-    of1Fetch(`/location?session_key=latest&date_gt=${since}`),
-    of1Fetch(`/car_data?session_key=latest&date_gt=${since}`),
+    repo.fetchLiveLocation(SINCE_MS),
+    repo.fetchLiveCarData(SINCE_MS),
   ])
 
-  // ── Positions ─────────────────────────────────────────────────
   const positions = {}
   if (locResult.status === 'fulfilled' && Array.isArray(locResult.value)) {
-    // Entries are chronological; last write per driver = most recent
+    // Entries are chronological; last write per driver = most recent position
     for (const e of locResult.value) {
-      if (e.x != null && e.y != null) {
+      if (e.x != null && e.y != null)
         positions[String(e.driver_number)] = { x: e.x, y: e.y }
-      }
     }
   }
 
-  // ── Telemetry ─────────────────────────────────────────────────
   const telemetry = {}
   if (carResult.status === 'fulfilled' && Array.isArray(carResult.value)) {
     const latest = new Map()
@@ -593,138 +279,11 @@ export async function getLiveCarData() {
     }
     for (const [num, e] of latest) {
       telemetry[num] = {
-        rpm:      e.rpm      ?? null,
-        gear:     e.n_gear   ?? null,
-        throttle: e.throttle ?? null,
-        brake:    e.brake    ?? null,
-        drs:      e.drs      ?? null,
-        speed:    e.speed    ?? null,
+        rpm: e.rpm ?? null, gear: e.n_gear ?? null, throttle: e.throttle ?? null,
+        brake: e.brake ?? null, drs: e.drs ?? null, speed: e.speed ?? null,
       }
     }
   }
 
   return { positions, telemetry }
-}
-
-export async function getLivePositions(sessionKey) {
-  const [allPos, allLaps, allPits, drivers] = await Promise.all([
-    cachedFetch(sessionKey, 'position', `/position?session_key=${sessionKey}`),
-    cachedFetch(sessionKey, 'laps',     `/laps?session_key=${sessionKey}`),
-    cachedFetch(sessionKey, 'pit',      `/pit?session_key=${sessionKey}`),
-    cachedFetch(sessionKey, 'drivers',  `/drivers?session_key=${sessionKey}`),
-  ])
-
-  const driverMap = new Map(drivers.map(d => [d.driver_number, d]))
-
-  // Pit sets per driver
-  const pitsByDriver = new Map()
-  for (const p of allPits) {
-    if (!p.pit_duration || p.pit_duration < 2) continue
-    const k = String(p.driver_number)
-    if (!pitsByDriver.has(k)) pitsByDriver.set(k, new Set())
-    pitsByDriver.get(k).add(p.lap_number)
-  }
-
-  // Sort position history per driver
-  const posByDriver = new Map()
-  for (const p of allPos) {
-    const k = p.driver_number
-    if (!posByDriver.has(k)) posByDriver.set(k, [])
-    posByDriver.get(k).push({ t: new Date(p.date).getTime(), pos: p.position })
-  }
-  for (const arr of posByDriver.values()) arr.sort((a, b) => a.t - b.t)
-
-  // Build lap-end times from laps: lapNum → date_start + lap_duration (same logic as seeder)
-  const lapEndTimes = new Map()
-  for (const l of allLaps) {
-    if (!l.lap_number || !l.lap_duration || !l.date_start) continue
-    const lapEndMs = new Date(l.date_start).getTime() + parseFloat(l.lap_duration) * 1000
-    if (!lapEndTimes.has(l.lap_number)) lapEndTimes.set(l.lap_number, lapEndMs)
-  }
-
-  const maxLap = lapEndTimes.size ? Math.max(...lapEndTimes.keys()) : 0
-
-  // Build per-driver position maps (lap → position), mirroring the seeder
-  const driverLapPos = new Map()
-  for (const [num, posHistory] of posByDriver) {
-    const lapMap = new Map()
-    for (const [lap, lapEndMs] of lapEndTimes) {
-      let pos = null
-      for (const p of posHistory) {
-        if (p.t <= lapEndMs) pos = p.pos
-        else break
-      }
-      if (pos !== null) lapMap.set(lap, pos)
-    }
-    // Backfill lap 1 if missing
-    if (!lapMap.has(1) && lapMap.size > 0) {
-      const firstLap = Math.min(...lapMap.keys())
-      lapMap.set(1, lapMap.get(firstLap))
-    }
-    driverLapPos.set(num, lapMap)
-  }
-
-  // Build positionsByLap array for the chart
-  const activeNums = [...driverLapPos.keys()]
-  const positionsByLap = Array.from({ length: maxLap }, (_, i) => {
-    const lap = i + 1
-    const row = { lap }
-    for (const num of activeNums) {
-      const pos = driverLapPos.get(num)?.get(lap)
-      if (pos != null) row[String(num)] = pos
-    }
-    return row
-  })
-
-  // Build driver result list
-  const result = [...posByDriver.keys()].map(num => {
-    const dId     = String(num)
-    const d       = driverMap.get(num)
-    const lapMap  = driverLapPos.get(num)
-    const lastLap = lapMap?.size ? Math.max(...lapMap.keys()) : null
-    const dns     = !lapMap || lapMap.size === 0
-    const dnf     = !dns && lastLap !== null && lastLap < maxLap - 1
-    return {
-      driverId: dId,
-      acronym:  d?.name_acronym || dId,
-      teamName: d?.team_name    || '',
-      pitLaps:  [...(pitsByDriver.get(dId) || [])],
-      dns,
-      dnf,
-      lastLap,
-    }
-  })
-
-  return { drivers: result, laps: positionsByLap, totalLaps: maxLap }
-}
-
-// ── OpenF1 race session catalogue (for production without Cassandra) ──────────
-
-let _of1RaceSessionsCache = null
-let _of1RaceSessionsAt    = 0
-const OF1_SESSIONS_TTL    = 60 * 60_000  // 1 hour
-
-/**
- * Return all Race sessions from OpenF1 for 2023 to the current year.
- * OpenF1 coverage starts at 2023. Cached for 1 hour.
- */
-export async function getOpenF1RaceSessions() {
-  const now = Date.now()
-  if (_of1RaceSessionsCache && now - _of1RaceSessionsAt < OF1_SESSIONS_TTL)
-    return _of1RaceSessionsCache
-
-  const thisYear = new Date().getFullYear()
-  const years    = Array.from({ length: thisYear - 2023 + 1 }, (_, i) => 2023 + i)
-  const all = []
-  await Promise.allSettled(
-    years.map(async y => {
-      try {
-        const sessions = await of1Fetch(`/sessions?session_type=Race&year=${y}`)
-        if (Array.isArray(sessions)) all.push(...sessions)
-      } catch {}
-    })
-  )
-  _of1RaceSessionsCache = all
-  _of1RaceSessionsAt    = now
-  return all
 }
