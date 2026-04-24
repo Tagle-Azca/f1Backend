@@ -30,7 +30,7 @@ async function findTeammate(races, driverLower) {
   return { myDriverId: null, teammateName: null }
 }
 
-function computeH2H(races, driverLower, teammateLower) {
+export function computeH2H(races, driverLower, teammateLower) {
   let raceDriver = 0, raceMate = 0, racesCompared = 0
   let qualiDriver = 0, qualiMate = 0, qualiCompared = 0
   let qualiGapSum = 0, qualiGapCount = 0

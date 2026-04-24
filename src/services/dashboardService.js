@@ -255,7 +255,7 @@ function applySnapshotToCtorPoints(ctorPoints, snap, completedRaces) {
   }
 }
 
-function computeStandings(completedRaces, snap) {
+export function computeStandings(completedRaces, snap) {
   const driverPoints = new Map()
   const ctorPoints   = new Map()
 

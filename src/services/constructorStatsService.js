@@ -39,8 +39,6 @@ export async function getCircuitHistoryData(id) {
     raceRepo.findLastCompletedByCircuitId(id),
   ])
 
-  if (!circuit) return null
-
   if (lastRace) await enrichFromJolpica(lastRace)
 
   let cassandraRaceId = null
@@ -60,7 +58,7 @@ export async function getCircuitHistoryData(id) {
       if (match) cassandraRaceId = match.race_id
     } catch {}
 
-    // 2. Fallback to OpenF1 sessions catalogue
+    // 2. Fallback to OpenF1 sessions catalogue filtered by year
     if (!cassandraRaceId) {
       try {
         const sessions = await getOpenF1RaceSessions()
@@ -73,6 +71,30 @@ export async function getCircuitHistoryData(id) {
       } catch {}
     }
   }
+
+  // 3. No MongoDB race found — match circuitId directly against OpenF1 catalogue (most recent completed)
+  if (!cassandraRaceId) {
+    try {
+      const normId      = norm(id.replace(/_/g, ' '))
+      const now         = new Date()
+      const currentYear = now.getFullYear()
+      const sessions    = await getOpenF1RaceSessions()
+      const match       = sessions
+        .filter(s => {
+          if (s.year >= currentYear) return false
+          const end = s.date_end ? new Date(s.date_end) : (s.date_start ? new Date(s.date_start) : null)
+          if (!end || end >= now) return false
+          const hayName = norm(s.meeting_name)
+          const hayLoc  = norm(s.location || '')
+          return (hayName && hayName.includes(normId)) ||
+                 (hayLoc && (hayLoc === normId || hayLoc.includes(normId)))
+        })
+        .sort((a, b) => new Date(b.date_end || b.date_start) - new Date(a.date_end || a.date_start))[0]
+      if (match) cassandraRaceId = `${match.year}_${match.session_key}`
+    } catch {}
+  }
+
+  if (!circuit && !lastRace && (!races || !races.length) && !cassandraRaceId) return null
 
   return { circuit, races, lastRace: lastRace || null, cassandraRaceId }
 }

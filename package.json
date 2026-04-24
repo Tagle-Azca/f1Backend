@@ -16,7 +16,10 @@
     "seed:history": "node scripts/seed.js --mongo --all-history",
     "fetch:photos": "node scripts/fetchPhotos.js",
     "fetch:circuits": "node scripts/fetchCircuitLayouts.js",
-    "init": "npm run db:up && npm run seed"
+    "init": "npm run db:up && npm run seed",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:log": "node scripts/test.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -34,6 +37,7 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.0",
+    "vitest": "^4.1.4"
   }
 }

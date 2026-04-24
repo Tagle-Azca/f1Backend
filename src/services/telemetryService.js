@@ -14,7 +14,7 @@ import {
   getLivePositions,
   getSafetyCarPeriods,
 } from './openf1Telemetry.js'
-import { getOpenF1RaceSessions } from '../repositories/openf1Repository.js'
+import { getOpenF1RaceSessions, fetchPositions } from '../repositories/openf1Repository.js'
 import {
   getF1LiveClassification,
   isF1LiveConnected,
@@ -269,7 +269,7 @@ export async function getTireStrategy(raceId) {
 
 // ── Winner tire strategy ──────────────────────────────────────────────────────
 
-function resolveHistoricalWinnerId(stints, posRows, totalLaps) {
+export function resolveHistoricalWinnerId(stints, posRows, totalLaps) {
   // 1. Scan backwards from final lap for position=1 (Cassandra stores as int or string)
   let winnerId = null
   if (posRows.length) {
@@ -309,13 +309,29 @@ export async function getWinnerStrategy(raceId) {
       Promise.resolve(getF1LiveClassification()),
     ])
     if (!strategy.length) return null
-    const p1Num  = liveClass?.classification?.find(d => d.position === 1)?.driverNum
-    const winner = p1Num ? strategy.find(d => d.driverId === String(p1Num)) : strategy[0]
+    const p1Num = liveClass?.classification?.find(d => d.position === 1)?.driverNum
+    let winner  = p1Num ? strategy.find(d => d.driverId === String(p1Num)) : null
+
+    // No live classification — past session not yet in Cassandra: resolve from OpenF1 positions
+    if (!winner) {
+      try {
+        const positions = await fetchPositions(key)
+        const p1entries = positions.filter(p => p.position === 1)
+        if (p1entries.length) {
+          const latest = p1entries.sort((a, b) => new Date(b.date) - new Date(a.date))[0]
+          winner = strategy.find(d => d.driverId === String(latest.driver_number))
+        }
+      } catch {}
+    }
+
+    if (!winner) winner = strategy[0]
     if (!winner) return null
+    const totalLaps = liveClass?.totalLaps ||
+      (winner.stints.at(-1)?.lapEnd ?? null)
     return {
       driverId: winner.driverId, acronym: winner.acronym,
       fullName: winner.fullName, teamName: winner.teamName,
-      totalLaps: liveClass?.totalLaps || null,
+      totalLaps,
       stints: winner.stints.map(s => ({
         stintNumber: s.stintNumber,
         compound:    (s.compound || 'UNKNOWN').toUpperCase(),
