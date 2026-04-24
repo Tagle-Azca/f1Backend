@@ -64,6 +64,7 @@ export async function getCircuitHistoryData(id) {
         const sessions = await getOpenF1RaceSessions()
         const match = sessions.find(s => {
           const hay = norm(s.meeting_name)
+          if (!hay) return false
           return String(s.year) === season &&
             (hay === needle || hay.includes(needle.slice(0, 5)) || needle.includes(hay.slice(0, 5)))
         })
