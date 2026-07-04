@@ -205,14 +205,17 @@ async function resolveNextRace(seasonRaces, jolpicaAllRaces, calendarForGapCheck
   const nextRace = upcomingRaces[0] || null
   if (!nextRace) return null
 
-  const raceTime = (nextRace.time || '00:00:00').replace(/Z$/i, '')
-  const raceDate = new Date(`${nextRace.date}T${raceTime}Z`)
   const schedule = await fetchWeekendSchedule(nextRace.season, nextRace.round)
+  // Mongo docs created from partial syncs can lack `time` — the official
+  // weekend schedule is the fallback before assuming midnight
+  const startTime = nextRace.time || schedule?.race?.time || null
+  const raceTime  = (startTime || '00:00:00').replace(/Z$/i, '')
+  const raceDate  = new Date(`${nextRace.date}T${raceTime}Z`)
   const { nextSession, currentSession } = resolveCurrentAndNextSession(schedule, raceDate)
 
   return {
     season: nextRace.season, round: nextRace.round, raceName: nextRace.raceName,
-    date: nextRace.date, time: nextRace.time || null, raceDateTime: raceDate.toISOString(),
+    date: nextRace.date, time: startTime, raceDateTime: raceDate.toISOString(),
     circuit: nextRace.Circuit?.circuitName || '', circuitId: nextRace.Circuit?.circuitId || '',
     locality: nextRace.Circuit?.Location?.locality || '', country: nextRace.Circuit?.Location?.country || '',
     daysUntil: Math.max(0, Math.ceil((raceDate - new Date()) / (1000 * 60 * 60 * 24))),

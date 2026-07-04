@@ -177,9 +177,11 @@ async function syncSprintResults(year) {
   for (const jr of sraces) {
     if (!jr.SprintResults?.length) continue
     await raceRepository.upsertResults(jr.season, jr.round, {
-      // Included so a sprint synced before the race doesn't create a nameless doc
+      // Included so a sprint synced before the race doesn't create a doc
+      // without name/schedule (the dashboard countdown depends on time)
       raceName: jr.raceName,
       date:     jr.date,
+      time:     jr.time || null,
       SprintResults: jr.SprintResults.map(r => ({
         position: r.position, points: r.points, grid: r.grid, laps: r.laps, status: r.status,
         Driver:      { driverId: r.Driver?.driverId, givenName: r.Driver?.givenName, familyName: r.Driver?.familyName },
