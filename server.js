@@ -10,6 +10,7 @@ import { startF1LiveTiming, scheduleConnect, isF1LiveConnected, isSessionArchive
 import { setF1LiveStateGetter } from './src/services/openf1Live.js'
 import SessionSnapshot from './src/models/SessionSnapshot.js'
 import { scheduleAutoSeed } from './src/services/autoSeedService.js'
+import { syncCurrentSeasonIfStale, schedulePostSessionResultSync } from './src/services/raceSyncService.js'
 import logger from './src/utils/logger.js'
 
 const app  = express()
@@ -101,12 +102,18 @@ async function start() {
       } catch (e) {
         logger.error('[F1Live] failed to persist snapshot: ' + e.message)
       }
+      // Pull official results into Mongo as soon as Jolpica publishes them,
+      // so standings stop depending on the live snapshot within the hour
+      if (snapshot.isRaceType) schedulePostSessionResultSync()
     })
     // When a session ends, immediately find and schedule the next one
     setOnSessionArchived(refreshF1Schedule)
     refreshF1Schedule()
     // Re-check schedule every hour in case of schedule changes
     setInterval(refreshF1Schedule, 60 * 60_000)
+    // Catch up race results missed while the server was offline
+    syncCurrentSeasonIfStale()
+      .catch(err => logger.warn(`[SyncRaces] Startup catch-up failed: ${err.message}`))
   })
 }
 

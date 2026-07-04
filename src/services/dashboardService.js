@@ -38,9 +38,16 @@ async function resolveLastRace(currentYear, seasonRaces, today) {
   const currentYearCompleted = seasonRaces.filter(r => toDateStr(r.date) <= today && r.Results?.length)
   let completedRaces = currentYearCompleted
 
+  // Sprint-only rounds (sprint done, race pending) don't count as "completed"
+  // but their points must still feed the standings. No date filter: stored
+  // results imply the session already happened, and the race date is later
+  // than the sprint it would wrongly exclude.
+  let standingsRaces = seasonRaces.filter(r => r.Results?.length || r.SprintResults?.length)
+
   if (!completedRaces.length) {
     const prevRaces    = await raceRepository.findBySeasonForCalendar(String(Number(currentYear) - 1))
     completedRaces = prevRaces.filter(r => r.Results?.length)
+    if (!standingsRaces.length) standingsRaces = completedRaces
   }
 
   const calendarForGapCheck    = jolpicaAllRaces ?? await safeCalendar(currentYear)
@@ -54,7 +61,7 @@ async function resolveLastRace(currentYear, seasonRaces, today) {
   if (jolpicaLastCompleted && (!lastMongoRace || parseInt(jolpicaLastCompleted.round) > parseInt(lastMongoRace.round))) {
     try {
       lastRaceFromJolpica = await jolpica.fetchRoundResults(currentYear, jolpicaLastCompleted.round)
-    } catch { /* fall back to MongoDB */ }
+    } catch (err) { logger.warn({ err: err.message }, '[Dashboard] Jolpica lastRace fetch failed, falling back to MongoDB') }
   }
 
   return {
@@ -63,6 +70,7 @@ async function resolveLastRace(currentYear, seasonRaces, today) {
     calendarTotal,
     currentYearCompleted,
     completedRaces,
+    standingsRaces,
     jolpicaAllRaces,
     calendarForGapCheck,
   }
@@ -130,7 +138,10 @@ async function fetchWeekendSchedule(season, round) {
     if (jr.Qualifying)     s.qualifying       = { date: jr.Qualifying.date,     time: jr.Qualifying.time }
     s.race = { date: jr.date, time: jr.time }
     return s
-  } catch { return null }
+  } catch (err) {
+    logger.warn({ err: err.message }, '[Dashboard] Jolpica schedule fetch failed')
+    return null
+  }
 }
 
 function resolveCurrentAndNextSession(schedule, raceDate) {
@@ -211,10 +222,41 @@ async function resolveNextRace(seasonRaces, jolpicaAllRaces, calendarForGapCheck
 
 // ── Standings helpers ──────────────────────────────────────────────────────────
 
+// A snapshot belongs to a race if it was saved within the same race weekend
+const SAME_WEEKEND_MS = 4 * 24 * 60 * 60 * 1000
+
+export function isSameRaceWeekend(snapSavedAt, raceDate) {
+  if (!snapSavedAt || !raceDate) return false
+  const snapMs = new Date(snapSavedAt).getTime()
+  const raceMs = new Date(`${toDateStr(raceDate)}T12:00:00Z`).getTime()
+  return Number.isFinite(snapMs) && Number.isFinite(raceMs) && Math.abs(snapMs - raceMs) <= SAME_WEEKEND_MS
+}
+
+// Fallback for snapshots without savedAt — SignalR meeting names can differ
+// from Ergast race names (e.g. "Spanish GP" vs "Barcelona Grand Prix"), so
+// date matching above is always preferred.
+function matchesRaceName(mongoRaceName, snapRaceName) {
+  if (!mongoRaceName || !snapRaceName) return false
+  return mongoRaceName.toLowerCase().includes(snapRaceName.toLowerCase().split(' ').slice(0, 2).join(' '))
+}
+
 function isSnapshotAlreadyInMongo(completedRaces, snap, isSprint) {
   return completedRaces.some(r => {
-    const nameMatch = r.raceName?.toLowerCase().includes(snap.raceName?.toLowerCase().split(' ').slice(0, 2).join(' '))
-    return nameMatch && (isSprint ? r.SprintResults?.length : r.Results?.length)
+    const sameRace = r.date && snap.savedAt
+      ? isSameRaceWeekend(snap.savedAt, r.date)
+      : matchesRaceName(r.raceName, snap.raceName)
+    return sameRace && (isSprint ? r.SprintResults?.length : r.Results?.length)
+  })
+}
+
+function findSnapshotDriverEntry(driverPoints, driver) {
+  const fullName = (driver.fullName || '').toLowerCase()
+  const lastName = (driver.lastName || '').toLowerCase()
+  return [...driverPoints.values()].find(v => {
+    const name = (v.name || '').toLowerCase()
+    if (fullName && name === fullName) return true
+    // endsWith handles multi-word last names ("de Vries") that split(' ').pop() breaks
+    return lastName && name.endsWith(lastName)
   })
 }
 
@@ -227,7 +269,7 @@ function applySnapshotToDriverPoints(driverPoints, snap, completedRaces) {
   for (const driver of snap.classification) {
     const pts = POINTS_TBL[driver.position] || 0
     if (!pts) continue
-    let entry = [...driverPoints.values()].find(v => v.name?.split(' ').pop()?.toLowerCase() === driver.lastName?.toLowerCase())
+    let entry = findSnapshotDriverEntry(driverPoints, driver)
     if (!entry) {
       const dId = `snap_${driver.driverNum}`
       driverPoints.set(dId, { driverId: dId, name: driver.fullName || driver.acronym, team: driver.teamName || '', constructorId: '', points: 0 })
@@ -255,7 +297,51 @@ function applySnapshotToCtorPoints(ctorPoints, snap, completedRaces) {
   }
 }
 
-export function computeStandings(completedRaces, snap) {
+function finalizeStandings(driverPoints, ctorPoints, snap, completedRaces) {
+  if (snap?.classification?.length && snap.isRaceType) {
+    applySnapshotToDriverPoints(driverPoints, snap, completedRaces)
+    applySnapshotToCtorPoints(ctorPoints, snap, completedRaces)
+  }
+
+  const standings = [...driverPoints.values()]
+    .sort((a, b) => b.points - a.points)
+    .map((d, i) => ({ ...d, position: i + 1, points: roundPoints(d.points) }))
+
+  const constructorStandings = [...ctorPoints.values()]
+    .sort((a, b) => b.points - a.points)
+    .map((c, i) => ({ ...c, position: i + 1, points: roundPoints(c.points) }))
+
+  return { standings, constructorStandings }
+}
+
+function buildStandingsMapsFromJolpica(driverList, ctorList) {
+  const driverPoints = new Map()
+  const ctorPoints   = new Map()
+
+  for (const s of driverList) {
+    driverPoints.set(s.Driver.driverId, {
+      driverId:      s.Driver.driverId,
+      name:          `${s.Driver.givenName} ${s.Driver.familyName}`,
+      team:          s.Constructors?.[0]?.name || '',
+      constructorId: s.Constructors?.[0]?.constructorId || '',
+      points:        parseFloat(s.points),
+      wins:          parseInt(s.wins),
+    })
+  }
+
+  for (const s of ctorList) {
+    ctorPoints.set(s.Constructor.constructorId, {
+      constructorId: s.Constructor.constructorId,
+      name:          s.Constructor.name,
+      points:        parseFloat(s.points),
+      wins:          parseInt(s.wins),
+    })
+  }
+
+  return { driverPoints, ctorPoints }
+}
+
+function buildStandingsMapsFromMongo(completedRaces) {
   const driverPoints = new Map()
   const ctorPoints   = new Map()
 
@@ -279,20 +365,12 @@ export function computeStandings(completedRaces, snap) {
     }
   }
 
-  if (snap?.classification?.length && snap.isRaceType) {
-    applySnapshotToDriverPoints(driverPoints, snap, completedRaces)
-    applySnapshotToCtorPoints(ctorPoints, snap, completedRaces)
-  }
+  return { driverPoints, ctorPoints }
+}
 
-  const standings = [...driverPoints.values()]
-    .sort((a, b) => b.points - a.points)
-    .map((d, i) => ({ ...d, position: i + 1, points: roundPoints(d.points) }))
-
-  const constructorStandings = [...ctorPoints.values()]
-    .sort((a, b) => b.points - a.points)
-    .map((c, i) => ({ ...c, position: i + 1, points: roundPoints(c.points) }))
-
-  return { standings, constructorStandings }
+export function computeStandings(completedRaces, snap) {
+  const { driverPoints, ctorPoints } = buildStandingsMapsFromMongo(completedRaces)
+  return finalizeStandings(driverPoints, ctorPoints, snap, completedRaces)
 }
 
 // ── Export ─────────────────────────────────────────────────────────────────────
@@ -303,14 +381,38 @@ export async function getDashboardData() {
 
   const seasonRaces = await raceRepository.findBySeasonForCalendar(currentYear)
 
-  const { lastRace, lastRaceFromJolpica, calendarTotal, currentYearCompleted, completedRaces, jolpicaAllRaces, calendarForGapCheck } =
+  const { lastRace, lastRaceFromJolpica, calendarTotal, currentYearCompleted, completedRaces, standingsRaces, jolpicaAllRaces, calendarForGapCheck } =
     await resolveLastRace(currentYear, seasonRaces, today)
 
   const lastRaceData = buildLastRaceData(lastRace, lastRaceFromJolpica)
   const nextRaceData = await resolveNextRace(seasonRaces, jolpicaAllRaces, calendarForGapCheck, today, Date.now())
 
   const snap = getLastSessionSnapshot()
-  const { standings, constructorStandings } = computeStandings(completedRaces, snap)
+
+  let standings, constructorStandings
+  if (lastRaceFromJolpica) {
+    // Jolpica already has the latest round, so its standings include the
+    // snapshot's session — adding snapshot points on top would double count
+    const snapForStandings = snap && isSameRaceWeekend(snap.savedAt, lastRaceFromJolpica.date)
+      ? null
+      : snap
+
+    const [jDrivers, jCtors] = await Promise.allSettled([
+      jolpica.fetchDriverStandings(currentYear),
+      jolpica.fetchConstructorStandings(currentYear),
+    ])
+    if (jDrivers.status === 'fulfilled' && jDrivers.value.length) {
+      const { driverPoints, ctorPoints } = buildStandingsMapsFromJolpica(
+        jDrivers.value,
+        jCtors.status === 'fulfilled' ? jCtors.value : [],
+      )
+      ;({ standings, constructorStandings } = finalizeStandings(driverPoints, ctorPoints, snapForStandings, standingsRaces))
+    } else {
+      ;({ standings, constructorStandings } = computeStandings(standingsRaces, snap))
+    }
+  } else {
+    ;({ standings, constructorStandings } = computeStandings(standingsRaces, snap))
+  }
 
   if (standings[0]) {
     const leaderMeta = await driverRepository.findDriverMeta(standings[0].driverId)

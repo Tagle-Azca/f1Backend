@@ -29,10 +29,18 @@ afterEach(() => vi.unstubAllGlobals())
 
 // ── fetchRaceResultsByYear ────────────────────────────────────────────────────
 
+function mockPagedFetch(pages) {
+  const mock = vi.fn()
+  for (const page of pages) {
+    mock.mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve(page) })
+  }
+  vi.stubGlobal('fetch', mock)
+}
+
 describe('fetchRaceResultsByYear', () => {
   it('returns Races array', async () => {
     const races = [jolpicaRace(), jolpicaRace({ round: '2' })]
-    mockFetch({ MRData: { RaceTable: { Races: races } } })
+    mockFetch({ MRData: { total: '2', RaceTable: { Races: races } } })
 
     const result = await fetchRaceResultsByYear('2024')
     expect(result).toEqual(races)
@@ -54,7 +62,29 @@ describe('fetchRaceResultsByYear', () => {
     await fetchRaceResultsByYear('2024')
     const [url] = vi.mocked(fetch).mock.calls[0]
     expect(url).toContain('/2024/results.json')
-    expect(url).toContain('limit=500')
+    expect(url).toContain('limit=100')
+    expect(url).toContain('offset=0')
+  })
+
+  it('fetches all pages and merges a race split across page boundaries', async () => {
+    const page1 = { MRData: { total: '120', RaceTable: { Races: [
+      jolpicaRace({ round: '1', Results: [{ position: '1' }, { position: '2' }] }),
+      jolpicaRace({ round: '2', Results: [{ position: '1' }] }),
+    ] } } }
+    const page2 = { MRData: { total: '120', RaceTable: { Races: [
+      jolpicaRace({ round: '2', Results: [{ position: '2' }, { position: '3' }] }),
+      jolpicaRace({ round: '3', Results: [{ position: '1' }] }),
+    ] } } }
+    mockPagedFetch([page1, page2])
+
+    const result = await fetchRaceResultsByYear('2024')
+
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(2)
+    expect(vi.mocked(fetch).mock.calls[1][0]).toContain('offset=100')
+    expect(result).toHaveLength(3)
+    expect(result.find(r => r.round === '2').Results).toEqual(
+      [{ position: '1' }, { position: '2' }, { position: '3' }]
+    )
   })
 })
 

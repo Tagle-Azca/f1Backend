@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { computeStandings } from './dashboardService.js'
+import { computeStandings, isSameRaceWeekend } from './dashboardService.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -173,5 +173,72 @@ describe('computeStandings — live snapshot', () => {
 
     // Sprint P1 = 8 points (not 25)
     expect(standings[0].points).toBe(8)
+  })
+
+  it('skips snapshot by date even when Ergast and SignalR race names differ', () => {
+    // Ergast: "Barcelona Grand Prix" — SignalR meeting: "Spanish Grand Prix"
+    const completedRaces = [{
+      ...race('Barcelona Grand Prix', [result('ver', 'Max', 'Verstappen', 1, 25, 'red_bull', 'Red Bull')]),
+      date: '2026-06-07',
+    }]
+    const liveSnap = {
+      ...snap('Spanish Grand Prix', [snapDriver(1, 'Verstappen', 'Max Verstappen', 'Red Bull', 1)]),
+      savedAt: '2026-06-07T15:30:00Z',
+    }
+
+    const { standings } = computeStandings(completedRaces, liveSnap)
+
+    expect(standings.find(d => d.driverId === 'ver').points).toBe(25)  // no double count
+  })
+
+  it('applies snapshot when saved on a later race weekend', () => {
+    const completedRaces = [{
+      ...race('Barcelona Grand Prix', [result('ver', 'Max', 'Verstappen', 1, 25, 'red_bull', 'Red Bull')]),
+      date: '2026-06-07',
+    }]
+    const liveSnap = {
+      ...snap('Austrian Grand Prix', [snapDriver(1, 'Verstappen', 'Max Verstappen', 'Red Bull', 1)]),
+      savedAt: '2026-06-21T15:30:00Z',
+    }
+
+    const { standings } = computeStandings(completedRaces, liveSnap)
+
+    expect(standings.find(d => d.driverId === 'ver').points).toBe(50)
+  })
+
+  it('merges snapshot points for multi-word last names instead of duplicating', () => {
+    const completedRaces = [
+      race('Bahrain Grand Prix', [result('de_vries', 'Nyck', 'de Vries', 1, 25, 'alphatauri', 'AlphaTauri')]),
+    ]
+    const liveSnap = snap('Monaco Grand Prix', [
+      snapDriver(1, 'de Vries', 'Nyck de Vries', 'AlphaTauri', 21),
+    ])
+
+    const { standings } = computeStandings(completedRaces, liveSnap)
+
+    expect(standings).toHaveLength(1)
+    expect(standings[0].driverId).toBe('de_vries')
+    expect(standings[0].points).toBe(50)
+  })
+})
+
+// ── isSameRaceWeekend ─────────────────────────────────────────────────────────
+
+describe('isSameRaceWeekend', () => {
+  it('matches a snapshot saved hours after the race date', () => {
+    expect(isSameRaceWeekend('2026-07-05T17:45:00Z', '2026-07-05')).toBe(true)
+  })
+
+  it('matches a sprint snapshot saved the day before the race date', () => {
+    expect(isSameRaceWeekend('2026-07-04T15:00:00Z', '2026-07-05')).toBe(true)
+  })
+
+  it('rejects a snapshot from a different weekend', () => {
+    expect(isSameRaceWeekend('2026-06-21T15:00:00Z', '2026-07-05')).toBe(false)
+  })
+
+  it('rejects missing values', () => {
+    expect(isSameRaceWeekend(null, '2026-07-05')).toBe(false)
+    expect(isSameRaceWeekend('2026-07-05T15:00:00Z', null)).toBe(false)
   })
 })

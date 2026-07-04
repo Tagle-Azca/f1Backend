@@ -1,6 +1,10 @@
 import * as raceRepository   from '../repositories/raceRepository.js'
 import * as driverRepository from '../repositories/driverRepository.js'
+import * as jolpica          from '../repositories/jolpicaRepository.js'
+import { cached } from '../utils/cache.js'
 import { buildDriverName, roundPoints, normalizeRaceName } from '../utils/formatters.js'
+
+const OFFICIAL_STANDINGS_TTL = 10 * 60_000
 
 /** Converts a per-round points array into a cumulative running-total array. */
 function buildCumulativePoints(earnedPoints) {
@@ -11,6 +15,30 @@ function buildCumulativePoints(earnedPoints) {
     cumulative.push(roundPoints(total))
   }
   return cumulative
+}
+
+/**
+ * Official standings from Jolpica — the source of truth for final points,
+ * positions and tie-breaks (covers penalties and wins countback that a plain
+ * sum of race points cannot). Returns [] on failure so callers fall back to
+ * the Mongo-computed totals.
+ */
+async function fetchOfficialDriverStandings(season) {
+  try {
+    return await cached(`standings:official:drivers:${season}`, OFFICIAL_STANDINGS_TTL,
+      () => jolpica.fetchDriverStandings(season))
+  } catch {
+    return []
+  }
+}
+
+async function fetchOfficialConstructorStandings(season) {
+  try {
+    return await cached(`standings:official:constructors:${season}`, OFFICIAL_STANDINGS_TTL,
+      () => jolpica.fetchConstructorStandings(season))
+  } catch {
+    return []
+  }
 }
 
 /**
@@ -31,11 +59,14 @@ export async function getSeasonStandings(season) {
     date:     r.date,
   }))
 
-  const driverInfo   = new Map() // driverId → { driverId, name, team, teamId }
+  const driverInfo   = new Map() // driverId → { driverId, name, team, teamId, wins }
   const pointsMatrix = new Map() // driverId → Array<number>
 
   races.forEach((race, idx) => {
-    for (const result of [...(race.Results || []), ...(race.SprintResults || [])]) {
+    const raceResults   = (race.Results || []).map(r => ({ ...r, isSprint: false }))
+    const sprintResults = (race.SprintResults || []).map(r => ({ ...r, isSprint: true }))
+
+    for (const result of [...raceResults, ...sprintResults]) {
       if (!result.Driver?.driverId) continue
       const dId = result.Driver.driverId
       const pts = parseFloat(result.points) || 0
@@ -46,6 +77,7 @@ export async function getSeasonStandings(season) {
           name:     buildDriverName(result.Driver),
           team:     result.Constructor?.name           || '',
           teamId:   result.Constructor?.constructorId || '',
+          wins:     0,
         })
         pointsMatrix.set(dId, new Array(races.length).fill(0))
       }
@@ -53,22 +85,45 @@ export async function getSeasonStandings(season) {
         driverInfo.get(dId).team   = result.Constructor.name
         driverInfo.get(dId).teamId = result.Constructor.constructorId
       }
+      if (!result.isSprint && parseInt(result.position) === 1) driverInfo.get(dId).wins++
       pointsMatrix.get(dId)[idx] += pts
     }
   })
 
-  const driverIds  = [...driverInfo.keys()]
-  const driverDocs = await driverRepository.findByIds(driverIds)
+  const [driverDocs, officialStandings] = await Promise.all([
+    driverRepository.findByIds([...driverInfo.keys()]),
+    fetchOfficialDriverStandings(season),
+  ])
   const numberMap  = new Map(driverDocs.map(d => [d.driverId, d.permanentNumber || d.code || null]))
+  const officialByDriver = new Map(officialStandings.map(s => [s.Driver?.driverId, s]))
 
   const drivers = []
   for (const [dId, info] of driverInfo) {
-    const cumulative  = buildCumulativePoints(pointsMatrix.get(dId))
-    const finalPoints = cumulative[cumulative.length - 1] ?? 0
-    drivers.push({ ...info, number: numberMap.get(dId) || null, finalPoints, cumulative })
+    const cumulative = buildCumulativePoints(pointsMatrix.get(dId))
+    const official   = officialByDriver.get(dId)
+
+    // Ergast lists every constructor the driver raced for; the last is current
+    const currentCtor = official?.Constructors?.[official.Constructors.length - 1]
+    if (currentCtor) {
+      info.team   = currentCtor.name
+      info.teamId = currentCtor.constructorId
+    }
+
+    drivers.push({
+      ...info,
+      number:           numberMap.get(dId) || null,
+      wins:             official ? parseInt(official.wins) || 0 : info.wins,
+      finalPoints:      official ? roundPoints(parseFloat(official.points) || 0) : cumulative[cumulative.length - 1] ?? 0,
+      officialPosition: official ? parseInt(official.position) || null : null,
+      cumulative,
+    })
   }
 
-  drivers.sort((a, b) => b.finalPoints - a.finalPoints)
+  drivers.sort((a, b) =>
+    (a.officialPosition ?? Infinity) - (b.officialPosition ?? Infinity)
+    || b.finalPoints - a.finalPoints
+    || b.wins - a.wins
+  )
 
   return { rounds, drivers }
 }
@@ -91,31 +146,49 @@ export async function getConstructorStandings(season) {
     date:     r.date,
   }))
 
-  const ctorInfo     = new Map() // constructorId → { constructorId, name }
+  const ctorInfo     = new Map() // constructorId → { constructorId, name, wins }
   const pointsMatrix = new Map() // constructorId → Array<number>
 
   races.forEach((race, idx) => {
-    for (const result of [...(race.Results || []), ...(race.SprintResults || [])]) {
+    const raceResults   = (race.Results || []).map(r => ({ ...r, isSprint: false }))
+    const sprintResults = (race.SprintResults || []).map(r => ({ ...r, isSprint: true }))
+
+    for (const result of [...raceResults, ...sprintResults]) {
       if (!result.Constructor?.constructorId) continue
       const cId = result.Constructor.constructorId
       const pts = parseFloat(result.points) || 0
 
       if (!ctorInfo.has(cId)) {
-        ctorInfo.set(cId, { constructorId: cId, name: result.Constructor.name })
+        ctorInfo.set(cId, { constructorId: cId, name: result.Constructor.name, wins: 0 })
         pointsMatrix.set(cId, new Array(races.length).fill(0))
       }
+      if (!result.isSprint && parseInt(result.position) === 1) ctorInfo.get(cId).wins++
       pointsMatrix.get(cId)[idx] += pts
     }
   })
 
+  const officialStandings = await fetchOfficialConstructorStandings(season)
+  const officialByCtor    = new Map(officialStandings.map(s => [s.Constructor?.constructorId, s]))
+
   const constructors = []
   for (const [cId, info] of ctorInfo) {
-    const cumulative  = buildCumulativePoints(pointsMatrix.get(cId))
-    const finalPoints = cumulative[cumulative.length - 1] ?? 0
-    constructors.push({ ...info, finalPoints, cumulative })
+    const cumulative = buildCumulativePoints(pointsMatrix.get(cId))
+    const official   = officialByCtor.get(cId)
+
+    constructors.push({
+      ...info,
+      wins:             official ? parseInt(official.wins) || 0 : info.wins,
+      finalPoints:      official ? roundPoints(parseFloat(official.points) || 0) : cumulative[cumulative.length - 1] ?? 0,
+      officialPosition: official ? parseInt(official.position) || null : null,
+      cumulative,
+    })
   }
 
-  constructors.sort((a, b) => b.finalPoints - a.finalPoints)
+  constructors.sort((a, b) =>
+    (a.officialPosition ?? Infinity) - (b.officialPosition ?? Infinity)
+    || b.finalPoints - a.finalPoints
+    || b.wins - a.wins
+  )
 
   return { rounds, constructors }
 }
