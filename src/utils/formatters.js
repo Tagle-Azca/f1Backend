@@ -21,6 +21,13 @@ export function normalizeRaceName(name) {
 }
 
 /**
+ * Escapes regex special characters so user input can be safely used inside `new RegExp(...)`.
+ */
+export function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
  * Format a lap time in seconds to "M:SS.mmm" string.
  * Returns null for falsy input.
  * Example: 92.456 → "1:32.456"
@@ -30,4 +37,15 @@ export function fmtLapTime(sec) {
   const m = Math.floor(sec / 60)
   const s = (sec % 60).toFixed(3).padStart(6, '0')
   return `${m}:${s}`
+}
+
+/**
+ * Parses a lap time string ("M:SS.mmm" or plain seconds) to a number of seconds.
+ * Returns null for falsy input. Inverse of fmtLapTime.
+ */
+export function parseLapTime(str) {
+  if (!str) return null
+  const parts = str.split(':')
+  if (parts.length === 2) return parseFloat(parts[0]) * 60 + parseFloat(parts[1])
+  return parseFloat(str)
 }

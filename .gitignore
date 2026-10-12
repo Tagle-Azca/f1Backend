@@ -2,6 +2,11 @@ node_modules/
 .env
 *.log
 
+# Stray dumps — guards against `mongodump --out ~/...` writing here when the
+# shell doesn't expand `~` (e.g. inside quotes or a subprocess call)
+/~/
+*.bson
+
 # npm artifacts
 f1db-back@1.0.0
 node

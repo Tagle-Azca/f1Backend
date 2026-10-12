@@ -349,14 +349,16 @@ function buildStandingsMapsFromMongo(completedRaces) {
   const ctorPoints   = new Map()
 
   for (const race of completedRaces) {
-    for (const r of [...(race.Results || []), ...(race.SprintResults || [])]) {
+    const gp = race.Results || []
+    for (const r of [...gp, ...(race.SprintResults || [])]) {
       const pts = parseFloat(r.points) || 0
 
       if (r.Driver?.driverId) {
         const id = r.Driver.driverId
         if (!driverPoints.has(id)) driverPoints.set(id, { driverId: id, name: buildDriverName(r.Driver), team: '', constructorId: '', points: 0, wins: 0 })
         driverPoints.get(id).points += pts
-        if (parseInt(r.position) === 1) driverPoints.get(id).wins++
+        // Wins are Grand Prix wins only, as in the official standings; sprint P1s add points, not wins
+        if (parseInt(r.position) === 1 && gp.includes(r)) driverPoints.get(id).wins++
         if (r.Constructor?.name) { driverPoints.get(id).team = r.Constructor.name; driverPoints.get(id).constructorId = r.Constructor.constructorId }
       }
 
@@ -417,13 +419,14 @@ export async function getDashboardData() {
     ;({ standings, constructorStandings } = computeStandings(standingsRaces, snap))
   }
 
-  if (standings[0]) {
-    const leaderMeta = await driverRepository.findDriverMeta(standings[0].driverId)
-    if (leaderMeta) {
-      standings[0].photoUrl        = leaderMeta.photoUrl        || null
-      standings[0].permanentNumber = leaderMeta.permanentNumber || leaderMeta.code || null
+  // Photo + number for the title-fight contenders (top 3), not just the leader
+  await Promise.all(standings.slice(0, 3).map(async row => {
+    const meta = await driverRepository.findDriverMeta(row.driverId).catch(() => null)
+    if (meta) {
+      row.photoUrl        = meta.photoUrl        || null
+      row.permanentNumber = meta.permanentNumber || meta.code || null
     }
-  }
+  }))
 
   const recentSession = await fetchLastSession(nextRaceData, lastRaceData)
   const lastSession   = recentSession || (lastRaceData ? { sessionType: 'Race', sessionLabel: 'Race', ...lastRaceData } : null)

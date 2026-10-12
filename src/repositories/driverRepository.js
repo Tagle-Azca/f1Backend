@@ -1,5 +1,6 @@
 import Driver from '../models/Driver.js'
 import Race   from '../models/Race.js'
+import { escapeRegex } from '../utils/formatters.js'
 
 /**
  * Paginated list of drivers with optional filters.
@@ -11,9 +12,10 @@ export function findAll({ search, nationality, skip: rawSkip, page = 1, limit = 
   const filter = {}
   if (nationality) filter.nationality = nationality
   if (search) {
+    const regex = new RegExp(escapeRegex(search), 'i')
     filter.$or = [
-      { givenName:  { $regex: search, $options: 'i' } },
-      { familyName: { $regex: search, $options: 'i' } },
+      { givenName:  regex },
+      { familyName: regex },
     ]
   }
   const skip = rawSkip != null ? rawSkip : (page - 1) * limit

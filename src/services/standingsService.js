@@ -6,6 +6,29 @@ import { buildDriverName, roundPoints, normalizeRaceName } from '../utils/format
 
 const OFFICIAL_STANDINGS_TTL = 10 * 60_000
 
+/**
+ * Round list for the chart. `complete` is false while only the sprint has run
+ * (the Grand Prix result is not in yet), so clients can count finished rounds.
+ */
+function buildRounds(races) {
+  return races.map(r => ({
+    round:    r.round,
+    raceName: normalizeRaceName(r.raceName),
+    date:     r.date,
+    complete: Boolean(r.Results?.length),
+  }))
+}
+
+/** Calendar length for the season (cached in the Jolpica repository); null when unknown. */
+async function seasonLength(season) {
+  try {
+    const cal = await jolpica.fetchCalendar(season)
+    return cal?.length || null
+  } catch {
+    return null
+  }
+}
+
 /** Converts a per-round points array into a cumulative running-total array. */
 function buildCumulativePoints(earnedPoints) {
   const cumulative = []
@@ -49,15 +72,11 @@ async function fetchOfficialConstructorStandings(season) {
 export async function getSeasonStandings(season) {
   const races = await raceRepository.findBySeasonForStandings(season)
 
-  if (!races.length) return { rounds: [], drivers: [] }
+  if (!races.length) return { rounds: [], drivers: [], totalRounds: null }
 
   races.sort((a, b) => Number(a.round) - Number(b.round))
 
-  const rounds = races.map(r => ({
-    round:    r.round,
-    raceName: normalizeRaceName(r.raceName),
-    date:     r.date,
-  }))
+  const rounds = buildRounds(races)
 
   const driverInfo   = new Map() // driverId → { driverId, name, team, teamId, wins }
   const pointsMatrix = new Map() // driverId → Array<number>
@@ -125,7 +144,7 @@ export async function getSeasonStandings(season) {
     || b.wins - a.wins
   )
 
-  return { rounds, drivers }
+  return { rounds, drivers, totalRounds: (await seasonLength(season)) ?? rounds.length }
 }
 
 /**
@@ -136,15 +155,11 @@ export async function getSeasonStandings(season) {
 export async function getConstructorStandings(season) {
   const races = await raceRepository.findBySeasonForStandings(season)
 
-  if (!races.length) return { rounds: [], constructors: [] }
+  if (!races.length) return { rounds: [], constructors: [], totalRounds: null }
 
   races.sort((a, b) => Number(a.round) - Number(b.round))
 
-  const rounds = races.map(r => ({
-    round:    r.round,
-    raceName: normalizeRaceName(r.raceName),
-    date:     r.date,
-  }))
+  const rounds = buildRounds(races)
 
   const ctorInfo     = new Map() // constructorId → { constructorId, name, wins }
   const pointsMatrix = new Map() // constructorId → Array<number>
@@ -190,7 +205,7 @@ export async function getConstructorStandings(season) {
     || b.wins - a.wins
   )
 
-  return { rounds, constructors }
+  return { rounds, constructors, totalRounds: (await seasonLength(season)) ?? rounds.length }
 }
 
 /**

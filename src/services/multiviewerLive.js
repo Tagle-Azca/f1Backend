@@ -4,6 +4,8 @@
  * Returns 404 when no session is active — treated as "not live"
  */
 
+import { parseLapTime } from '../utils/formatters.js'
+
 // Multiviewer desktop app exposes live timing locally on port 10101
 const BASE    = 'http://localhost:10101/api/v2/live-timing/state'
 const HEADERS = { 'User-Agent': 'F1IntelligencePlatform/1.0' }
@@ -20,13 +22,6 @@ async function mvFetch(endpoint) {
   // Multiviewer returns { success: false, error: "..." } when Live Timing isn't open
   if (json?.success === false) return null
   return json
-}
-
-function parseLapTime(str) {
-  if (!str) return null
-  const parts = str.split(':')
-  if (parts.length === 2) return parseFloat(parts[0]) * 60 + parseFloat(parts[1])
-  return parseFloat(str)
 }
 
 const RACE_TYPES = new Set(['Race', 'Sprint'])

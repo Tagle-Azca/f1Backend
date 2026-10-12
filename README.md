@@ -89,7 +89,13 @@ API available at **http://localhost:8741**.
 | `ASTRA_CLIENT_ID` | — | Astra client ID |
 | `ASTRA_CLIENT_SECRET` | — | Astra client secret |
 | `DGRAPH_URL` | `localhost:9080` | Dgraph gRPC address |
+| `DGRAPH_API_KEY` | — | Dgraph Cloud API key (TLS auth, production only) |
 | `FRONTEND_URL` | `http://localhost:5173` | CORS allowed origin |
+| `JWT_ACCESS_SECRET` | — | **Required.** Signing secret for access tokens |
+| `JWT_REFRESH_SECRET` | — | **Required.** Signing secret for refresh tokens |
+| `GOOGLE_CLIENT_ID` | — | Required for Google sign-in (`POST /api/auth/google`) |
+| `ADMIN_SEED_TOKEN` | — | Required to call `/api/admin/*` (send as `X-Admin-Token` header) |
+| `LOG_LEVEL` | `info` | Pino log level |
 
 ---
 

@@ -12,7 +12,9 @@
 
 import WebSocket from 'ws'
 import zlib from 'zlib'
+import { EventEmitter } from 'events'
 import { clearLiveSessionCache } from './openf1Live.js'
+import { parseLapTime } from '../utils/formatters.js'
 import logger from '../utils/logger.js'
 
 const BASE        = 'https://livetiming.formula1.com'
@@ -52,6 +54,42 @@ function decompressZ(b64) {
 let lastSessionSnapshot = null
 // Key of the session we already snapshotted — prevents re-saving on reconnect
 let archivedSessionKey  = null
+
+// ── Live availability broadcast (push instead of frontend polling) ─────────
+const statusEmitter = new EventEmitter()
+let lastStatus = { available: false }
+
+function currentStatus() {
+  const c = getF1LiveClassification()
+  if (!c) return { available: false }
+  return {
+    available:  true,
+    sessionName: c.sessionName,
+    raceName:    c.raceName,
+    isRaceType:  c.isRaceType,
+  }
+}
+
+function broadcastStatusIfChanged() {
+  const status = currentStatus()
+  if (status.available === lastStatus.available &&
+      status.sessionName === lastStatus.sessionName &&
+      status.raceName === lastStatus.raceName) return
+  lastStatus = status
+  statusEmitter.emit('status', status)
+  logger.info(`[F1Live] status broadcast: available=${status.available}${status.sessionName ? ` (${status.sessionName} — ${status.raceName})` : ''}`)
+}
+
+/** Subscribe to live-availability changes. Returns an unsubscribe function. */
+export function onLiveStatusChange(cb) {
+  statusEmitter.on('status', cb)
+  return () => statusEmitter.off('status', cb)
+}
+
+/** Current availability snapshot — send this immediately when a client subscribes. */
+export function getLiveStatusSnapshot() {
+  return lastStatus
+}
 
 function sessionKey() {
   const s = state.SessionInfo
@@ -95,6 +133,18 @@ let connected    = false
 let reconnecting = false
 let reconnectCount = 0
 let connectTimer = null   // handle for scheduled future connection
+let endTimer     = null   // handle for scheduled post-session disconnect
+
+const SESSION_END_GRACE_MS = 3 * 60_000  // stay connected 3min after chequered flag, then disconnect
+
+function scheduleSessionEndClose() {
+  if (endTimer || archivedSessionKey) return
+  logger.info('[F1Live] chequered flag detected — closing connection in 3min')
+  endTimer = setTimeout(() => {
+    endTimer = null
+    try { ws?.close() } catch (e) { logger.error(`[F1Live] close error: ${e.message}`) }
+  }, SESSION_END_GRACE_MS)
+}
 
 /** Timestamp (ms) when we first received live session data — used to auto-expire stale live sessions */
 let sessionDataStartTime = null
@@ -109,12 +159,6 @@ let onFinalSnapshot = null
 export function setOnFinalSnapshot(fn) { onFinalSnapshot = fn }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-function parseLapTime(str) {
-  if (!str) return null
-  const parts = str.split(':')
-  if (parts.length === 2) return parseFloat(parts[0]) * 60 + parseFloat(parts[1])
-  return parseFloat(str)
-}
 
 /**
  * Deep-merge `patch` into `target` (handles nested objects, not arrays).
@@ -225,7 +269,7 @@ function handleMessage(raw) {
       const lc = state.LapCount
       if (lc?.TotalLaps > 0 && lc?.CurrentLap >= lc?.TotalLaps) {
         logger.info(`[F1Live] reconnected to finished race (lap ${lc.CurrentLap}/${lc.TotalLaps}) — archiving immediately`)
-        setTimeout(() => saveSnapshot(true), 500)
+        setTimeout(() => { saveSnapshot(true); broadcastStatusIfChanged() }, 500)
       }
     }
   }
@@ -243,6 +287,8 @@ function handleMessage(raw) {
         const newName = data.Name || data.Type || ''
         if (newName && oldName && newName !== oldName) {
           saveSnapshot(true)
+          clearTimeout(endTimer); endTimer = null
+          try { ws?.close() } catch (e) { logger.error(`[F1Live] close error: ${e.message}`) }
         }
       }
 
@@ -268,6 +314,13 @@ function handleMessage(raw) {
       }
     }
   }
+
+  // Chequered flag (status 3) means the session is over — disconnect shortly after
+  if (String(state.TrackStatus?.Status) === '3') {
+    scheduleSessionEndClose()
+  }
+
+  broadcastStatusIfChanged()
 }
 
 async function connectWs() {
@@ -324,6 +377,7 @@ async function connectWs() {
             const mins = Math.round(elapsed / 60_000)
             logger.info(`[F1Live] session exceeded ${mins}min limit — auto-archiving as completed`)
             saveSnapshot(true)
+            broadcastStatusIfChanged()
             return
           }
 
@@ -332,7 +386,10 @@ async function connectWs() {
           logger.error(`[F1Live] snapshot interval error: ${e.message}`)
         }
       }, 30_000)
-      sock.once('close', () => clearInterval(snapshotInterval))
+      sock.once('close', () => {
+        clearInterval(snapshotInterval)
+        clearTimeout(endTimer); endTimer = null
+      })
     })().catch(e => logger.error(`[F1Live] open handler error: ${e.message}`))
   })
 
@@ -349,6 +406,7 @@ async function connectWs() {
     try { saveSnapshot(true) } catch (e) { logger.error(`[F1Live] saveSnapshot error on close: ${e.message}`) }
     state = { SessionInfo: null, DriverList: null, TimingData: null, TimingAppData: null, CarData: null, Position: null, LapCount: null, TrackStatus: null }
     logger.info(`[F1Live] disconnected (${code}) ${reason?.toString() || ''}`)
+    broadcastStatusIfChanged()
     scheduleReconnect()
   })
 
@@ -377,12 +435,12 @@ function scheduleReconnect() {
 }
 
 /**
- * Schedule a WebSocket connection 15 minutes before the given ISO session time.
+ * Schedule a WebSocket connection 1 minute before the given ISO session time.
  */
 export function scheduleConnect(isoTime) {
   if (connectTimer) { clearTimeout(connectTimer); connectTimer = null }
 
-  const msUntil = new Date(isoTime) - Date.now() - 15 * 60_000
+  const msUntil = new Date(isoTime) - Date.now() - 1 * 60_000
 
   if (msUntil <= 0) {
     logger.info('[F1Live] session imminent, connecting now')

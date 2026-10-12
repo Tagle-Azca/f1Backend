@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken'
+import crypto from 'crypto'
 
 const ACCESS_SECRET  = process.env.JWT_ACCESS_SECRET
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET
@@ -19,4 +20,14 @@ export function verifyAccessToken(token) {
 
 export function verifyRefreshToken(token) {
   return jwt.verify(token, REFRESH_SECRET)
+}
+
+/**
+ * Refresh tokens are stored hashed (not raw) so a database leak doesn't hand
+ * out directly-usable sessions. SHA-256 is enough here — these are
+ * high-entropy signed JWTs, not user-chosen secrets vulnerable to offline
+ * dictionary attacks, so bcrypt's slow-hash property buys nothing.
+ */
+export function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex')
 }

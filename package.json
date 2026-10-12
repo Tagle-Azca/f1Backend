@@ -15,6 +15,7 @@
     "seed:dgraph": "node scripts/seed.js --dgraph",
     "seed:history": "node scripts/seed.js --mongo --all-history",
     "fetch:photos": "node scripts/fetchPhotos.js",
+    "fetch:headshots": "node scripts/fetchHeadshots.js",
     "fetch:circuits": "node scripts/fetchCircuitLayouts.js",
     "init": "npm run db:up && npm run seed",
     "test": "vitest",

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveHistoricalWinnerId } from './telemetryService.js'
+import { resolveHistoricalWinnerId, sessionLabel, findCalendarRace } from './telemetryService.js'
 
 // ── resolveHistoricalWinnerId ─────────────────────────────────────────────────
 // Finds the race winner via 3 fallback strategies:
@@ -82,5 +82,38 @@ describe('resolveHistoricalWinnerId', () => {
       { driver_id: '1', stint_number: 1, lap_end: null },
     ]
     expect(resolveHistoricalWinnerId(stints, [], null)).toBeNull()
+  })
+})
+
+// ── findCalendarRace / sessionLabel ───────────────────────────────────────────
+
+describe('findCalendarRace + sessionLabel', () => {
+  const calendar = [
+    { round: '16', raceName: 'Bahrain Grand Prix in Malaysia', date: '2026-10-04', Circuit: { circuitId: 'sepang' } },
+    { round: '17', raceName: 'Singapore Grand Prix', date: '2026-10-11', Circuit: { circuitId: 'marina_bay' } },
+  ]
+  const session = (o) => ({ session_name: 'Race', country_name: 'Bahrain', circuit_short_name: 'Kuala Lumpur', ...o })
+  const label = (s) => sessionLabel(s, findCalendarRace(s, calendar))
+
+  it('matches a race to the GP on the same day', () => {
+    const s = session({ date_start: '2026-10-04T07:00:00+00:00' })
+    expect(findCalendarRace(s, calendar).round).toBe('16')
+    expect(label(s)).toBe('Bahrain Grand Prix in Malaysia')
+  })
+
+  it('matches a sprint to the GP that follows it', () => {
+    const s = session({ session_name: 'Sprint', date_start: '2026-10-10T09:00:00+00:00' })
+    expect(findCalendarRace(s, calendar).round).toBe('17')
+    expect(label(s)).toBe('Singapore Grand Prix (Sprint)')
+  })
+
+  it('falls back to the OpenF1 country when the calendar has no match', () => {
+    const s = session({ date_start: '2026-06-07T13:00:00+00:00' })
+    expect(findCalendarRace(s, calendar)).toBeNull()
+    expect(label(s)).toBe('Bahrain Grand Prix')
+  })
+
+  it('returns null when nothing usable is known', () => {
+    expect(label({ session_name: 'Race', date_start: 'bad' })).toBeNull()
   })
 })

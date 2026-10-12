@@ -7,6 +7,7 @@ import {
   fetchCalendar,
   fetchRaceSchedule,
   fetchSprintResultsByRound,
+  clearJolpicaCache,
 } from './jolpicaRepository.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ const jolpicaRace = (overrides = {}) => ({
   ...overrides,
 })
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); clearJolpicaCache() })
 
 // ── fetchRaceResultsByYear ────────────────────────────────────────────────────
 
@@ -205,5 +206,56 @@ describe('fetchSprintResultsByRound', () => {
     await fetchSprintResultsByRound('2024', '5')
     const [url] = vi.mocked(fetch).mock.calls[0]
     expect(url).toContain('/2024/5/sprint.json')
+  })
+})
+
+// ── Calendar / schedule cache ─────────────────────────────────────────────────
+
+describe('calendar and schedule cache', () => {
+  const ok  = (data) => ({ ok: true, status: 200, json: () => Promise.resolve(data) })
+  const err = (status) => ({ ok: false, status, json: () => Promise.resolve({}) })
+  const races = [jolpicaRace()]
+
+  beforeEach(() => vi.useFakeTimers({ toFake: ['Date'] }))
+
+  it('serves a fresh copy without refetching', async () => {
+    const mock = vi.fn().mockResolvedValue(ok({ MRData: { RaceTable: { Races: races } } }))
+    vi.stubGlobal('fetch', mock)
+    await fetchCalendar('2026')
+    await fetchCalendar('2026')
+    expect(mock).toHaveBeenCalledTimes(1)
+  })
+
+  it('dedupes concurrent requests', async () => {
+    const mock = vi.fn().mockResolvedValue(ok({ MRData: { RaceTable: { Races: races } } }))
+    vi.stubGlobal('fetch', mock)
+    await Promise.all([fetchRaceSchedule('2026', '17'), fetchRaceSchedule('2026', '17')])
+    expect(mock).toHaveBeenCalledTimes(1)
+  })
+
+  it('serves the stale copy when Jolpica rate-limits', async () => {
+    const mock = vi.fn()
+      .mockResolvedValueOnce(ok({ MRData: { RaceTable: { Races: races } } }))
+      .mockResolvedValueOnce(err(429))
+    vi.stubGlobal('fetch', mock)
+    await fetchCalendar('2026')
+    vi.setSystemTime(Date.now() + 11 * 60 * 1000)
+    expect(await fetchCalendar('2026')).toEqual(races)
+    expect(mock).toHaveBeenCalledTimes(2)
+  })
+
+  it('throws when the only copy is older than a day', async () => {
+    const mock = vi.fn()
+      .mockResolvedValueOnce(ok({ MRData: { RaceTable: { Races: races } } }))
+      .mockResolvedValueOnce(err(429))
+    vi.stubGlobal('fetch', mock)
+    await fetchCalendar('2026')
+    vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000)
+    await expect(fetchCalendar('2026')).rejects.toThrow('429')
+  })
+
+  it('throws when nothing was ever cached', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(err(429)))
+    await expect(fetchRaceSchedule('2026', '17')).rejects.toThrow('429')
   })
 })

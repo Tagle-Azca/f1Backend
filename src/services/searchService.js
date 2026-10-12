@@ -1,6 +1,7 @@
 import * as raceRepository    from '../repositories/raceRepository.js'
 import * as driverRepository  from '../repositories/driverRepository.js'
 import * as circuitRepository from '../repositories/circuitRepository.js'
+import { escapeRegex } from '../utils/formatters.js'
 
 /**
  * Search races, drivers, circuits, and constructors by query string.
@@ -11,7 +12,7 @@ import * as circuitRepository from '../repositories/circuitRepository.js'
  */
 export async function search(query, limit = 12) {
   const lim   = Math.min(Math.max(1, parseInt(limit) || 12), 50)
-  const regex = new RegExp(query.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+  const regex = new RegExp(escapeRegex(query.trim()), 'i')
 
   const [races, drivers, circuits, constructors] = await Promise.all([
     raceRepository.searchRaces(regex, lim),

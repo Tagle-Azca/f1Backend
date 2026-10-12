@@ -95,7 +95,27 @@ export async function getCircuitHistoryData(id) {
     } catch {}
   }
 
-  if (!circuit && !lastRace && (!races || !races.length) && !cassandraRaceId) return null
+  if (!circuit && !lastRace && (!races || !races.length) && !cassandraRaceId) {
+    // Could be a genuinely unknown id (typo) or a brand-new circuit that has
+    // never hosted a race yet — ask Jolpica, which carries circuit metadata
+    // (name, location) independently of race history, to tell them apart.
+    let jolpicaCircuit = null
+    try { jolpicaCircuit = await jolpica.fetchCircuitById(id) } catch {}
+    if (!jolpicaCircuit) return null
+
+    return {
+      circuit: {
+        circuitId:   jolpicaCircuit.circuitId,
+        circuitName: jolpicaCircuit.circuitName,
+        url:         jolpicaCircuit.url || null,
+        Location:    jolpicaCircuit.Location || {},
+        isNew:       true,
+      },
+      races: [],
+      lastRace: null,
+      cassandraRaceId: null,
+    }
+  }
 
   return { circuit, races, lastRace: lastRace || null, cassandraRaceId }
 }

@@ -21,8 +21,49 @@ import {
   getLastSessionSnapshot,
 } from './f1LiveTiming.js'
 import * as repo from '../repositories/telemetryRepository.js'
+import * as raceRepository from '../repositories/raceRepository.js'
 
 // ── Available races ────────────────────────────────────────────────────────────
+
+const DAY_MS = 86_400_000
+
+const raceDayMs = (date) => Date.parse(
+  typeof date === 'string' ? `${date.slice(0, 10)}T12:00:00Z` : new Date(date).toISOString().slice(0, 10) + 'T12:00:00Z',
+)
+
+/** The MongoDB GP a session belongs to: a race matches the same day, a sprint the GP 1-2 days later. */
+export function findCalendarRace(session, seasonRaces) {
+  const start = Date.parse(session.date_start)
+  if (!Number.isFinite(start)) return null
+  const isSprint = session.session_name === 'Sprint'
+  return seasonRaces.find(r => {
+    const diff = raceDayMs(r.date) - start
+    return isSprint ? diff > 0 && diff < 3 * DAY_MS : Math.abs(diff) < DAY_MS
+  }) || null
+}
+
+/**
+ * OpenF1 sessions carry no meeting name, so label them from the MongoDB
+ * calendar. Falls back to the OpenF1 country/circuit, never to the raw raceId.
+ */
+export function sessionLabel(session, match) {
+  const base = match?.raceName
+    || session.meeting_name
+    || (session.country_name ? `${session.country_name} Grand Prix` : null)
+    || session.circuit_short_name
+    || session.location
+  if (!base) return null
+  return session.session_name === 'Sprint' ? `${base} (Sprint)` : base
+}
+
+async function racesBySeason(years) {
+  const out = new Map()
+  await Promise.all([...years].map(async y => {
+    const races = await raceRepository.findBySeasonForCalendar(String(y)).catch(() => [])
+    out.set(String(y), races.filter(r => r.date && r.raceName))
+  }))
+  return out
+}
 
 export async function getAvailableRaces() {
   // Cassandra races (empty array if Cassandra is down)
@@ -30,23 +71,34 @@ export async function getAvailableRaces() {
   const seeded = rows.map(r => ({ raceId: r.race_id, raceName: r.race_name }))
   const ids    = new Set(seeded.map(r => r.raceId))
 
-  // OpenF1 race catalogue — fills gaps + provides dates for all races
-  const dateMap = new Map()  // raceId → date_start ISO string
+  // OpenF1 race catalogue — fills gaps + provides dates and labels for all races
+  const sessionMap = new Map()  // raceId → OpenF1 session
   try {
     const of1Sessions = await getOpenF1RaceSessions()
+    const calendars   = await racesBySeason(new Set(of1Sessions.map(s => s.year)))
     for (const s of of1Sessions) {
       const raceId = `${s.year}_${s.session_key}`
-      if (s.date_start) dateMap.set(raceId, s.date_start)
-      if (!ids.has(raceId)) {
-        seeded.push({ raceId, raceName: s.meeting_name || raceId })
+      sessionMap.set(raceId, s)
+      const match = findCalendarRace(s, calendars.get(String(s.year)) || [])
+      const label = sessionLabel(s, match)
+      let entry = seeded.find(r => r.raceId === raceId)
+      if (entry) {
+        if (label) entry.raceName = label
+      } else {
+        entry = { raceId, raceName: label || `Race ${s.session_key}` }
+        seeded.push(entry)
         ids.add(raceId)
       }
+      // Round and circuit let the client fetch results and the track map without guessing from names
+      if (match?.Circuit?.circuitId) entry.circuitId = match.Circuit.circuitId
+      if (match && s.session_name !== 'Sprint') entry.round = String(match.round)
     }
   } catch { /* best-effort */ }
 
   // Attach date to every entry (Cassandra-seeded ones included)
   for (const r of seeded) {
-    if (dateMap.has(r.raceId)) r.date = dateMap.get(r.raceId)
+    const s = sessionMap.get(r.raceId)
+    if (s?.date_start) r.date = s.date_start
   }
 
   // Live race currently happening
@@ -56,7 +108,9 @@ export async function getAvailableRaces() {
       seeded.push({ raceId: live.raceId, raceName: live.raceName, isLive: true })
   } catch { /* best-effort */ }
 
-  return seeded
+  // Chronological; undated entries last
+  const when = r => Date.parse(r.date) || Number.MAX_SAFE_INTEGER
+  return seeded.sort((a, b) => when(a) - when(b))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

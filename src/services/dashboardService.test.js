@@ -62,6 +62,21 @@ describe('computeStandings — points from Results', () => {
     expect(standings[0].wins).toBe(1)
   })
 
+  it('counts sprint points but not sprint wins', () => {
+    const races = [
+      race('Miami GP',
+        [result('norris', 'Lando', 'Norris', 2, 18, 'mclaren', 'McLaren'), result('russell', 'George', 'Russell', 1, 25, 'mercedes', 'Mercedes')],
+        [result('norris', 'Lando', 'Norris', 1, 8, 'mclaren', 'McLaren')]),
+      // Sprint-only weekend so far: P1 in the sprint, Grand Prix not run yet
+      race('Singapore GP', [], [result('norris', 'Lando', 'Norris', 1, 8, 'mclaren', 'McLaren')]),
+    ]
+    const { standings } = computeStandings(races, null)
+    const norris = standings.find(d => d.driverId === 'norris')
+    expect(norris.points).toBe(34)
+    expect(norris.wins).toBe(0)
+    expect(standings.find(d => d.driverId === 'russell').wins).toBe(1)
+  })
+
   it('includes SprintResults points', () => {
     const sprintResult = result('max_verstappen', 'Max', 'Verstappen', 1, 8, 'red_bull', 'Red Bull')
     const raceResult   = result('max_verstappen', 'Max', 'Verstappen', 1, 25, 'red_bull', 'Red Bull')

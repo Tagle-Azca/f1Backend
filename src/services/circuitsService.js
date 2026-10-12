@@ -1,5 +1,7 @@
 import * as circuitRepository from '../repositories/circuitRepository.js'
 import * as raceRepository    from '../repositories/raceRepository.js'
+import * as jolpica           from '../repositories/jolpicaRepository.js'
+import logger                 from '../utils/logger.js'
 
 // In-memory cache — circuit stats barely change (only after a seed)
 const TTL = 60 * 60 * 1000 // 1 hour
@@ -48,10 +50,30 @@ export async function listCircuits(filters = {}) {
 
 /**
  * Returns a single circuit by circuitId, or null if not found.
+ * Falls back to Jolpica for circuits that have never hosted a race yet
+ * (e.g. a track debuting this season) — our MongoDB Circuit collection is
+ * only populated from past results, so a brand-new venue wouldn't be there.
  * @param {string} circuitId
  * @returns {object|null}
  */
 export async function getCircuit(circuitId) {
   const circuit = await circuitRepository.findById(circuitId)
-  return circuit || null
+  if (circuit) return circuit
+
+  try {
+    const jc = await jolpica.fetchCircuitById(circuitId)
+    if (!jc) return null
+    return {
+      circuitId:    jc.circuitId,
+      circuitName:  jc.circuitName,
+      url:          jc.url || null,
+      Location:     jc.Location || {},
+      trackCoords:  null,
+      trackFetched: false,
+      isNew:        true, // no race history yet — frontend can show a "debut" note
+    }
+  } catch (err) {
+    logger.warn({ err: err.message, circuitId }, '[Circuits] Jolpica fallback failed')
+    return null
+  }
 }

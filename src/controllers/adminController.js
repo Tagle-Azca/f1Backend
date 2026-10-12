@@ -1,9 +1,16 @@
+import crypto from 'crypto'
 import * as raceSyncService from '../services/raceSyncService.js'
 import logger              from '../utils/logger.js'
 
 function validateToken(req) {
-  const token = req.query.token || req.headers['x-admin-token']
-  return process.env.ADMIN_SEED_TOKEN && token === process.env.ADMIN_SEED_TOKEN
+  const expected = process.env.ADMIN_SEED_TOKEN
+  const token    = req.headers['x-admin-token']
+  if (!expected || !token) return false
+
+  const a = Buffer.from(String(token))
+  const b = Buffer.from(String(expected))
+  // Constant-time compare; lengths must match first (timingSafeEqual throws otherwise)
+  return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
 
 export async function triggerCassandraSeed(req, res) {

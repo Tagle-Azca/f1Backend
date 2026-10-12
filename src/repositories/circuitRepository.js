@@ -1,5 +1,6 @@
 import Circuit from '../models/Circuit.js'
 import Race    from '../models/Race.js'
+import { escapeRegex } from '../utils/formatters.js'
 
 /**
  * All circuits with optional filters.
@@ -7,12 +8,13 @@ import Race    from '../models/Race.js'
  */
 export function findAll({ search, country } = {}) {
   const filter = {}
-  if (country) filter['Location.country'] = { $regex: country, $options: 'i' }
+  if (country) filter['Location.country'] = { $regex: escapeRegex(country), $options: 'i' }
   if (search) {
+    const regex = new RegExp(escapeRegex(search), 'i')
     filter.$or = [
-      { circuitName:          { $regex: search, $options: 'i' } },
-      { 'Location.country':   { $regex: search, $options: 'i' } },
-      { 'Location.locality':  { $regex: search, $options: 'i' } },
+      { circuitName:          regex },
+      { 'Location.country':   regex },
+      { 'Location.locality':  regex },
     ]
   }
   return Circuit.find(filter).sort({ circuitName: 1 }).lean()

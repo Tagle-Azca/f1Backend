@@ -29,7 +29,8 @@ const ALL_SEASONS = Array.from({ length: 2026 - 1950 }, (_, i) => String(1950 + 
 
 // ── Flags ────────────────────────────────────────────────
 const args = process.argv.slice(2)
-const RUN_ALL         = args.length === 0 || args.every(a => a.startsWith('--'))
+const DB_FLAGS        = ['--mongo', '--cassandra', '--dgraph']
+const RUN_ALL         = !args.some(a => DB_FLAGS.includes(a))
 const RUN_MONGO       = RUN_ALL || args.includes('--mongo')
 const RUN_CASSANDRA   = RUN_ALL || args.includes('--cassandra')
 const RUN_DGRAPH      = RUN_ALL || args.includes('--dgraph')
