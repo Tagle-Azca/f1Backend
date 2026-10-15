@@ -85,6 +85,8 @@ export async function listRaces(season) {
       })
 
       races.sort((a, b) => parseInt(a.round) - parseInt(b.round))
+      // Session times (FP1..race) per round, for the season calendar; null when Jolpica has none
+      races = races.map(r => ({ ...r, schedule: extractSchedule(jolpicaMap.get(r.round)) }))
     }
   }
 
