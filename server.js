@@ -6,6 +6,7 @@ import { connectMongo }    from './src/config/mongodb.js'
 import { connectCassandra } from './src/config/cassandra.js'
 import { connectDgraph }   from './src/config/dgraph.js'
 import routes from './src/routes/index.js'
+import { setRapidSession } from './src/services/rapidApiLive.js'
 import { startF1LiveTiming, scheduleConnect, isF1LiveConnected, isSessionArchived, setOnSessionArchived, setOnFinalSnapshot, getF1LiveClassification } from './src/services/f1LiveTiming.js'
 import { setF1LiveStateGetter } from './src/services/openf1Live.js'
 import SessionSnapshot from './src/models/SessionSnapshot.js'
@@ -111,6 +112,7 @@ async function start() {
     refreshF1Schedule()
     // Re-check schedule every hour in case of schedule changes
     setInterval(refreshF1Schedule, 60 * 60_000)
+    setInterval(labelRapidSession, 60_000)
     // Catch up race results missed while the server was offline
     syncCurrentSeasonIfStale()
       .catch(err => logger.warn(`[SyncRaces] Startup catch-up failed: ${err.message}`))
@@ -121,6 +123,37 @@ async function start() {
 const JOLPICA_SCHEDULE = 'https://api.jolpi.ca/ergast/f1/current.json'
 
 const SESSION_MAX_MS = 3 * 60 * 60_000  // 3h generous window per session
+
+const SESSION_FIELDS = [
+  ['FirstPractice',  'Practice 1'],
+  ['SecondPractice', 'Practice 2'],
+  ['ThirdPractice',  'Practice 3'],
+  ['SprintShootout', 'Sprint Qualifying'],
+  ['Sprint',         'Sprint'],
+  ['Qualifying',     'Qualifying'],
+]
+
+let cachedRaces = []
+
+// RapidAPI fallback: label the in-progress session (the timing endpoint carries none)
+function labelRapidSession() {
+  const now  = Date.now()
+  const live = sessionsOf(cachedRaces).find(x => now - x.start >= 0 && now - x.start <= SESSION_MAX_MS)
+  setRapidSession(live ? { sessionName: live.sessionName, raceName: live.raceName, endsAt: live.start + SESSION_MAX_MS } : null)
+}
+
+function sessionsOf(races) {
+  const out = []
+  for (const r of races) {
+    const add = (d, t, sessionName) => {
+      const start = d && t ? new Date(`${d}T${t}`).getTime() : NaN
+      if (!isNaN(start)) out.push({ start, sessionName, raceName: r.raceName })
+    }
+    for (const [key, name] of SESSION_FIELDS) add(r[key]?.date, r[key]?.time, name)
+    add(r.date, r.time, 'Race')
+  }
+  return out
+}
 
 async function refreshF1Schedule() {
   try {
@@ -143,6 +176,9 @@ async function refreshF1Schedule() {
     }
 
     const allDates = times.map(t => new Date(t)).filter(d => !isNaN(d))
+
+    cachedRaces = races
+    labelRapidSession()
 
     // Connect now if a session is currently within its window (schedule times can be off)
     const currentlyLive = allDates.find(d => {

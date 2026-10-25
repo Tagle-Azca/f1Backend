@@ -1,6 +1,7 @@
 import logger from '../utils/logger.js'
 import { fmtLapTime } from '../utils/formatters.js'
 import * as repo from '../repositories/openf1Repository.js'
+import { isLiveTimingEnabled } from '../config/liveTiming.js'
 
 // ── Session detection state ───────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ export async function findLiveRaceSession() {
 
 // Active sessions cached 30s; no-session result held 5 min to avoid hammering OpenF1.
 export async function findLiveSession() {
+  if (!isLiveTimingEnabled()) return null
   const now = Date.now()
 
   if (_liveSessionCache && now < _liveSessionCache.expiresAt)

@@ -15,6 +15,8 @@ import zlib from 'zlib'
 import { EventEmitter } from 'events'
 import { clearLiveSessionCache } from './openf1Live.js'
 import { parseLapTime } from '../utils/formatters.js'
+import { getRapidClassification, setRapidOnUpdate } from './rapidApiLive.js'
+import { isLiveTimingEnabled } from '../config/liveTiming.js'
 import logger from '../utils/logger.js'
 
 const BASE        = 'https://livetiming.formula1.com'
@@ -69,6 +71,8 @@ function currentStatus() {
     isRaceType:  c.isRaceType,
   }
 }
+
+setRapidOnUpdate(() => broadcastStatusIfChanged())
 
 function broadcastStatusIfChanged() {
   const status = currentStatus()
@@ -324,6 +328,7 @@ function handleMessage(raw) {
 }
 
 async function connectWs() {
+  if (!isLiveTimingEnabled()) return
   let negotiateData
   try {
     negotiateData = await negotiate()
@@ -438,6 +443,7 @@ function scheduleReconnect() {
  * Schedule a WebSocket connection 1 minute before the given ISO session time.
  */
 export function scheduleConnect(isoTime) {
+  if (!isLiveTimingEnabled()) return
   if (connectTimer) { clearTimeout(connectTimer); connectTimer = null }
 
   const msUntil = new Date(isoTime) - Date.now() - 1 * 60_000
@@ -467,7 +473,7 @@ export function scheduleConnect(isoTime) {
  * via refreshF1Schedule() in server.js — do NOT connect unconditionally.
  */
 export function startF1LiveTiming() {
-  logger.info('[F1Live] timing service initialized — waiting for schedule')
+  logger.info(isLiveTimingEnabled() ? '[F1Live] timing service initialized — waiting for schedule' : '[F1Live] disabled (set LIVE_TIMING_ENABLED=true to enable)')
 }
 
 /**
@@ -579,7 +585,7 @@ const TRACK_STATUS_MAP = {
 export function getF1LiveClassification() {
   const { SessionInfo, DriverList, TimingData, LapCount, TrackStatus } = state
 
-  if (!SessionInfo || !DriverList || !TimingData?.Lines) return null
+  if (!SessionInfo || !DriverList || !TimingData?.Lines) return getRapidClassification()
 
   const key = `${SessionInfo.Meeting?.Name || ''}|${SessionInfo.Name || SessionInfo.Type || ''}`
   if (archivedSessionKey === key) return null
